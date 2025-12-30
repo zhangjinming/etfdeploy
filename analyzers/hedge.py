@@ -130,65 +130,95 @@ class HedgeStrategy:
         """
         计算综合评分
         
-        综合考虑：
-        - 强弱信号得分（权重40%）
-        - 情绪阶段（权重35%）
-        - 情绪指数（权重15%）
-        - 绝望期深度加成（权重10%）
+        优化v2：
+        - 降低情绪阶段权重（35%→25%），提高强弱信号权重（40%→45%）
+        - 疯狂期不再一刀切惩罚，区分"强势疯狂"和"衰竭疯狂"
+        - 增加趋势确认因子
         
-        优化：深度绝望期给予额外加分，体现"行情在绝望中产生"
+        综合考虑：
+        - 强弱信号得分（权重45%）
+        - 情绪阶段（权重25%）
+        - 情绪指数（权重15%）
+        - 趋势确认加成（权重15%）
         """
         # 强弱得分（-5到5映射到-1到1）
         strength_score = strength['score'] / 5
         
-        # 情绪阶段得分
+        # 情绪阶段得分（优化：疯狂期惩罚力度降低）
         phase = emotion['phase']
         phase_strength = emotion.get('phase_strength', 0.5)
+        rsi = emotion.get('rsi', 50)
         
-        phase_scores = {
-            'despair': 1.0,      # 绝望期买入
-            'hesitation': 0.0,  # 犹豫期观望
-            'frenzy': -1.0,     # 疯狂期卖出
-            'unknown': 0.0
-        }
-        emotion_phase_score = phase_scores.get(phase, 0)
+        # 获取趋势信息
+        trend_info = strength.get('trend', {})
+        trend_direction = trend_info.get('direction', 'unknown')
+        trend_confirmed = trend_info.get('confirmed', False)
+        
+        # 动态计算情绪阶段得分
+        if phase == 'despair':
+            emotion_phase_score = 1.0  # 绝望期买入
+        elif phase == 'hesitation':
+            emotion_phase_score = 0.0  # 犹豫期观望
+        elif phase == 'frenzy':
+            # 优化：疯狂期根据趋势方向调整惩罚力度
+            if trend_direction == 'uptrend' and trend_confirmed:
+                # 强势疯狂：趋势向上确认，轻微惩罚
+                emotion_phase_score = -0.3
+            elif trend_direction == 'downtrend' and trend_confirmed:
+                # 衰竭疯狂：趋势向下确认，重度惩罚
+                emotion_phase_score = -1.0
+            else:
+                # 普通疯狂：中度惩罚
+                emotion_phase_score = -0.6
+        else:
+            emotion_phase_score = 0.0
         
         # 情绪指数（-1到1）
         emotion_index = emotion.get('emotion_index', 0)
         # 反转：低情绪指数反而是买入机会
         emotion_index_score = -emotion_index
         
-        # 深度绝望期加成：RSI极低 + 情绪指数极低 + 绝望期强度高
-        despair_bonus = 0
-        rsi = emotion.get('rsi', 50)
-        if phase == 'despair':
-            # RSI越低加成越多
-            if rsi < 25:
-                despair_bonus += 0.3
-            elif rsi < 35:
-                despair_bonus += 0.15
-            
-            # 情绪指数越低加成越多
-            if emotion_index < -0.5:
-                despair_bonus += 0.2
-            elif emotion_index < -0.3:
-                despair_bonus += 0.1
-            
-            # 绝望期强度加成
-            if phase_strength > 0.7:
-                despair_bonus += 0.15
+        # 趋势确认加成/惩罚
+        trend_bonus = 0
+        if trend_direction == 'uptrend':
+            if trend_confirmed:
+                trend_bonus = 0.4  # 上升趋势确认，强加成
+            else:
+                trend_bonus = 0.15  # 上升趋势未确认，轻加成
+        elif trend_direction == 'downtrend':
+            if trend_confirmed:
+                trend_bonus = -0.4  # 下降趋势确认，强惩罚
+            else:
+                trend_bonus = -0.15  # 下降趋势未确认，轻惩罚
         
-        # 综合评分
+        # 深度绝望期额外加成
+        despair_bonus = 0
+        if phase == 'despair':
+            if rsi < 25:
+                despair_bonus += 0.25
+            elif rsi < 35:
+                despair_bonus += 0.12
+            
+            if emotion_index < -0.5:
+                despair_bonus += 0.15
+            elif emotion_index < -0.3:
+                despair_bonus += 0.08
+            
+            if phase_strength > 0.7:
+                despair_bonus += 0.1
+        
+        # 综合评分（优化权重分配）
         composite = (
-            strength_score * 0.40 +
-            emotion_phase_score * 0.35 +
-            emotion_index_score * 0.15 +
-            despair_bonus * 0.10 / 0.10  # 归一化后的加成
+            strength_score * 0.45 +           # 强弱信号（提高权重）
+            emotion_phase_score * 0.25 +      # 情绪阶段（降低权重）
+            emotion_index_score * 0.15 +      # 情绪指数
+            trend_bonus * 0.15 +              # 趋势确认（新增）
+            despair_bonus                      # 绝望期加成
         )
         
         # 确保深度绝望期的ETF能获得足够高的分数
         if phase == 'despair' and despair_bonus > 0.3:
-            composite = max(composite, 0.4)  # 保底分数
+            composite = max(composite, 0.4)
         
         return composite
     
@@ -260,21 +290,20 @@ class HedgeStrategy:
         """
         选择多头持仓
         
-        优化：确保按综合得分从高到低选择，高分标的优先入选
+        纯按综合得分排序，不考虑分类限制
         """
         long_positions = []
-        selected_caps = {'large': 0, 'small': 0, 'sector': 0}
-        max_per_cap = 2  # 每类最多2个
-        max_positions = 4  # 最多4个多头
+        max_positions = 6  # 最多6个多头
+        min_score = 0.35  # 最低得分门槛
         
-        # 确保按综合得分降序排列
+        # 按综合得分降序排列
         sorted_by_score = sorted(
             sorted_etfs,
             key=lambda x: x[1]['composite_score'],
             reverse=True
         )
         
-        # 第一轮：优先选择高分标的（得分>0.35，提高门槛）
+        # 选择得分最高的前N个（得分>门槛）
         for symbol, analysis in sorted_by_score:
             if len(long_positions) >= max_positions:
                 break
@@ -282,15 +311,11 @@ class HedgeStrategy:
             composite_score = analysis['composite_score']
             cap_type = analysis['cap_type']
             
-            # 只选择得分较高的（提高门槛）
-            if composite_score <= 0.35:
+            # 只选择得分超过门槛的
+            if composite_score <= min_score:
                 continue
             
-            # 控制每类数量
-            if selected_caps[cap_type] >= max_per_cap:
-                continue
-            
-            # 计算权重（根据得分动态调整，更保守）
+            # 计算权重（根据得分动态调整）
             if composite_score > 0.6:
                 weight = 0.25
             elif composite_score > 0.45:
@@ -314,59 +339,16 @@ class HedgeStrategy:
                 'cap_type': cap_type,
                 'reason': '，'.join(reasons) if reasons else f"综合得分{composite_score:.2f}"
             })
-            
-            selected_caps[cap_type] += 1
-        
-        # 第二轮：如果持仓不足，补充得分>0.1的标的（提高门槛）
-        if len(long_positions) < max_positions:
-            for symbol, analysis in sorted_by_score:
-                if len(long_positions) >= max_positions:
-                    break
-                
-                # 跳过已选择的
-                if any(p['symbol'] == symbol for p in long_positions):
-                    continue
-                
-                composite_score = analysis['composite_score']
-                cap_type = analysis['cap_type']
-                
-                # 只选择正分的（提高门槛）
-                if composite_score <= 0.1:
-                    continue
-                
-                # 控制每类数量
-                if selected_caps[cap_type] >= max_per_cap:
-                    continue
-                
-                weight = 0.15  # 补充仓位权重较低
-                
-                # 构建理由
-                reasons = []
-                if analysis['strength']['signal'] in ['strong_buy', 'buy']:
-                    reasons.append(f"强弱信号:{analysis['strength']['signal']}")
-                if analysis['emotion']['phase'] == 'despair':
-                    reasons.append("处于绝望期")
-                reasons.extend(analysis['strength'].get('reasons', [])[:2])
-                
-                long_positions.append({
-                    'symbol': symbol,
-                    'name': analysis['name'],
-                    'weight': weight,
-                    'composite_score': composite_score,
-                    'cap_type': cap_type,
-                    'reason': '，'.join(reasons) if reasons else f"综合得分{composite_score:.2f}"
-                })
-                
-                selected_caps[cap_type] += 1
-        
-        # 按得分降序排列最终结果
-        long_positions.sort(key=lambda x: x['composite_score'], reverse=True)
         
         return long_positions
     
     def _select_hedge_positions(self, sorted_etfs: List, etf_analysis: Dict) -> List[Dict]:
         """
         选择谨慎/回避持仓（弱势标的）
+        
+        优化v2：区分"强势疯狂"和"衰竭疯狂"
+        - 强势疯狂：趋势强劲+高RSI，可能继续上涨，不应回避
+        - 衰竭疯狂：趋势衰竭+高RSI+量能萎缩，才应回避
         
         说明：这里的"对冲"是指识别出应该回避或减配的标的，
         而非做空。普通投资者可以：
@@ -376,24 +358,65 @@ class HedgeStrategy:
         """
         hedge_positions = []
         
+        # 长期趋势强劲的品种列表（红利、银行等防御性品种）
+        # 这些品种即使处于疯狂期，也可能继续上涨，需要更严格的回避条件
+        defensive_symbols = {'515450', '512800', '515180'}  # 红利低波50、银行ETF、红利ETF
+        
         # 从最弱的开始选
         for symbol, analysis in reversed(sorted_etfs):
             if len(hedge_positions) >= 2:  # 最多2个
                 break
             
             composite_score = analysis['composite_score']
+            emotion = analysis['emotion']
+            strength = analysis['strength']
+            phase = emotion['phase']
+            rsi = emotion.get('rsi', 50)
             
-            # 只选择负分的
+            # 基础门槛：只选择负分的
             if composite_score >= -0.2:
+                continue
+            
+            # === 优化：区分强势疯狂 vs 衰竭疯狂 ===
+            if phase == 'frenzy':
+                # 检查是否为"强势疯狂"（趋势强劲，不应回避）
+                trend_info = strength.get('trend', {})
+                trend_direction = trend_info.get('direction', 'unknown')
+                trend_confirmed = trend_info.get('confirmed', False)
+                
+                # 条件1：趋势向上且已确认 = 强势疯狂，跳过回避
+                if trend_direction == 'uptrend' and trend_confirmed:
+                    continue
+                
+                # 条件2：防御性品种（红利/银行）需要更严格的回避条件
+                if symbol in defensive_symbols:
+                    # RSI需要极端超买(>85)且有明确卖出信号才回避
+                    if rsi < 85 or strength['signal'] not in ['strong_sell', 'sell']:
+                        continue
+                
+                # 条件3：RSI在70-80之间，且没有明确卖出信号，可能是正常上涨
+                if 65 < rsi < 80 and strength['signal'] not in ['strong_sell', 'sell']:
+                    continue
+            
+            # === 优化：绝望期买入信号不应被回避 ===
+            # 如果处于绝望期且有买入信号，这是机会不是风险
+            if phase == 'despair' and strength['signal'] in ['strong_buy', 'buy']:
                 continue
             
             # 构建理由
             reasons = []
-            if analysis['strength']['signal'] in ['strong_sell', 'sell']:
-                reasons.append(f"强弱信号:{analysis['strength']['signal']}")
-            if analysis['emotion']['phase'] == 'frenzy':
-                reasons.append("处于疯狂期")
-            reasons.extend(analysis['strength'].get('reasons', [])[:2])
+            if strength['signal'] in ['strong_sell', 'sell']:
+                reasons.append(f"强弱信号:{strength['signal']}")
+            if phase == 'frenzy':
+                # 细化疯狂期描述
+                if rsi > 85:
+                    reasons.append("极度超买(RSI>85)")
+                else:
+                    reasons.append("处于疯狂期")
+            reasons.extend(strength.get('reasons', [])[:2])
+            
+            # 计算回避置信度（用于排序和展示）
+            avoid_confidence = self._calculate_avoid_confidence(analysis)
             
             hedge_positions.append({
                 'symbol': symbol,
@@ -402,10 +425,62 @@ class HedgeStrategy:
                 'composite_score': composite_score,
                 'cap_type': analysis['cap_type'],
                 'action': 'avoid',  # 明确操作建议
+                'avoid_confidence': avoid_confidence,
                 'reason': '，'.join(reasons) if reasons else f"综合得分{composite_score:.2f}，建议回避"
             })
         
+        # 按回避置信度排序，优先展示高置信度的
+        hedge_positions.sort(key=lambda x: x.get('avoid_confidence', 0), reverse=True)
+        
         return hedge_positions
+    
+    def _calculate_avoid_confidence(self, analysis: Dict) -> float:
+        """
+        计算回避信号的置信度
+        
+        高置信度回避条件：
+        1. 明确的卖出信号 + 疯狂期
+        2. RSI极端超买(>85)
+        3. 趋势向下确认
+        4. 近期涨幅过大(>20%)
+        
+        低置信度（不应回避）：
+        1. 趋势向上确认
+        2. 防御性品种正常波动
+        3. 绝望期抄底机会
+        """
+        confidence = 0.0
+        
+        emotion = analysis['emotion']
+        strength = analysis['strength']
+        phase = emotion['phase']
+        rsi = emotion.get('rsi', 50)
+        
+        # 卖出信号加分
+        if strength['signal'] == 'strong_sell':
+            confidence += 0.4
+        elif strength['signal'] == 'sell':
+            confidence += 0.25
+        
+        # 疯狂期加分（但需要配合其他条件）
+        if phase == 'frenzy':
+            confidence += 0.2
+            # RSI极端超买额外加分
+            if rsi > 85:
+                confidence += 0.3
+            elif rsi > 80:
+                confidence += 0.15
+        
+        # 趋势向下确认加分
+        trend_info = strength.get('trend', {})
+        if trend_info.get('direction') == 'downtrend' and trend_info.get('confirmed'):
+            confidence += 0.3
+        
+        # 趋势向上确认减分（强势不应回避）
+        if trend_info.get('direction') == 'uptrend' and trend_info.get('confirmed'):
+            confidence -= 0.4
+        
+        return max(0, min(1, confidence))
     
     def generate_scenario_strategies(self) -> Dict:
         """

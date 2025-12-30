@@ -70,13 +70,17 @@ class IntegratedETFStrategy:
             emotion_result = emotion_analyzer.get_emotion_phase()
             emotion_trend = emotion_analyzer.get_emotion_trend()
             
+            # 计算综合得分（复用HedgeStrategy的逻辑）
+            composite_score = self._calculate_composite_score(strength_result, emotion_result)
+            
             results['etf_analysis'][symbol] = {
                 'name': name,
                 'strength': strength_result,
                 'emotion': emotion_result,
                 'emotion_trend': emotion_trend,
+                'composite_score': composite_score,
                 'latest_price': df.iloc[-1]['close'],
-                'pct_change_20d': (df.iloc[-1]['close'] / df.iloc[-20]['close'] - 1) * 100 if len(df) >= 20 else 0
+                'pct_change_1m': (df.iloc[-1]['close'] / df.iloc[-30]['close'] - 1) * 100 if len(df) >= 30 else 0
             }
             
             signal_emoji = {
@@ -216,3 +220,67 @@ class IntegratedETFStrategy:
         print("    3. 恶炒消耗资金，价值白马领涨才有持续性")
         print("    4. 留有余地，仓位不可用足")
         print("    5. 策略比预测更重要，以变应变")
+    
+    def _calculate_composite_score(self, strength: Dict, emotion: Dict) -> float:
+        """
+        计算综合评分（与HedgeStrategy保持一致）
+        
+        综合考虑：
+        - 强弱信号得分（权重40%）
+        - 情绪阶段（权重35%）
+        - 情绪指数（权重15%）
+        - 绝望期深度加成（权重10%）
+        """
+        # 强弱得分（-5到5映射到-1到1）
+        strength_score = strength['score'] / 5
+        
+        # 情绪阶段得分
+        phase = emotion['phase']
+        phase_strength = emotion.get('phase_strength', 0.5)
+        
+        phase_scores = {
+            'despair': 1.0,      # 绝望期买入
+            'hesitation': 0.0,  # 犹豫期观望
+            'frenzy': -1.0,     # 疯狂期卖出
+            'unknown': 0.0
+        }
+        emotion_phase_score = phase_scores.get(phase, 0)
+        
+        # 情绪指数（-1到1）
+        emotion_index = emotion.get('emotion_index', 0)
+        # 反转：低情绪指数反而是买入机会
+        emotion_index_score = -emotion_index
+        
+        # 深度绝望期加成：RSI极低 + 情绪指数极低 + 绝望期强度高
+        despair_bonus = 0
+        rsi = emotion.get('rsi', 50)
+        if phase == 'despair':
+            # RSI越低加成越多
+            if rsi < 25:
+                despair_bonus += 0.3
+            elif rsi < 35:
+                despair_bonus += 0.15
+            
+            # 情绪指数越低加成越多
+            if emotion_index < -0.5:
+                despair_bonus += 0.2
+            elif emotion_index < -0.3:
+                despair_bonus += 0.1
+            
+            # 绝望期强度加成
+            if phase_strength > 0.7:
+                despair_bonus += 0.15
+        
+        # 综合评分
+        composite = (
+            strength_score * 0.40 +
+            emotion_phase_score * 0.35 +
+            emotion_index_score * 0.15 +
+            despair_bonus * 0.10 / 0.10  # 归一化后的加成
+        )
+        
+        # 确保深度绝望期的ETF能获得足够高的分数
+        if phase == 'despair' and despair_bonus > 0.3:
+            composite = max(composite, 0.4)  # 保底分数
+        
+        return composite
