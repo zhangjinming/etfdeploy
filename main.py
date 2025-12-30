@@ -36,7 +36,7 @@ if __name__ == "__main__":
     # main()
     
     # 模拟并验证历史数据
-    simulate_and_verify("2024-03-01", "2024-03-16")
+    simulate_and_verify("2020-07-01", "2020-12-30")
     
     # 仅模拟（不验证）
     # simulate_period("2024-03-01", "2024-03-16")

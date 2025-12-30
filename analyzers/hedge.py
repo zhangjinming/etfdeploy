@@ -2,11 +2,17 @@
 策略四：以变应变对冲战法
 核心逻辑：市场没有完美的预测，策略才是关键
 优化：结合周线分析，增加情绪和资金面因素
-新增：止损止盈机制，特殊资产处理
+新增：止损止盈机制，特殊资产处理，信号时效性
 """
 
+from datetime import datetime
 from typing import Dict, List, Optional
-from config import ETF_POOL, LARGE_CAP_ETFS, SMALL_CAP_ETFS, SPECIAL_ASSETS, RISK_PARAMS
+import numpy as np
+from config import (
+    ETF_POOL, LARGE_CAP_ETFS, SMALL_CAP_ETFS, SPECIAL_ASSETS, 
+    RISK_PARAMS, SIGNAL_VALIDITY, SIGNAL_THRESHOLDS, NO_DESPAIR_BUY_ASSETS,
+    SPECIAL_ASSET_RULES
+)
 from .strength import StrengthWeaknessAnalyzer
 from .emotion import EmotionCycleAnalyzer
 
@@ -21,18 +27,22 @@ class HedgeStrategy:
     3. 对冲保护，赚取风格强弱的利润
     4. 留有余地，仓位不可用足
     5. 新增：止损止盈纪律
+    6. 新增：信号时效性管理
     """
     
-    def __init__(self, data_fetcher, use_weekly: bool = True):
+    def __init__(self, data_fetcher, use_weekly: bool = True, market_regime: Dict = None):
         """
         初始化对冲策略生成器
         
         Args:
             data_fetcher: 数据获取器
             use_weekly: 是否使用周线分析
+            market_regime: 市场环境信息
         """
         self.data_fetcher = data_fetcher
         self.use_weekly = use_weekly
+        self.market_regime = market_regime
+        self.signal_history = {}  # 记录信号历史，用于时效性管理
     
     def generate_hedge_portfolio(self) -> Dict:
         """
@@ -43,12 +53,15 @@ class HedgeStrategy:
         2. 综合强弱信号和情绪阶段
         3. 大小盘对冲、行业分散
         4. 动态调整现金比例
+        5. 新增：信号置信度过滤
+        6. 新增：市场环境调整
         """
         portfolio = {
             'long_positions': [],
             'hedge_positions': [],
             'cash_ratio': 0.2,  # 基础现金比例
-            'analysis_mode': 'weekly' if self.use_weekly else 'daily'
+            'analysis_mode': 'weekly' if self.use_weekly else 'daily',
+            'market_regime': self.market_regime
         }
         
         # 分析各ETF
@@ -64,18 +77,26 @@ class HedgeStrategy:
             strength_analyzer = StrengthWeaknessAnalyzer(df, use_weekly=self.use_weekly, symbol=symbol)
             strength_result = strength_analyzer.analyze_strength()
             
-            # 情绪分析
+            # 情绪分析（传入市场环境）
             emotion_analyzer = EmotionCycleAnalyzer(df, use_weekly=self.use_weekly)
-            emotion_result = emotion_analyzer.get_emotion_phase()
+            emotion_result = emotion_analyzer.get_emotion_phase(market_regime=self.market_regime)
             
             # 综合评分
             composite_score = self._calculate_composite_score(strength_result, emotion_result)
+            
+            # === P0优化：综合得分为nan时标记为无效 ===
+            score_valid = not (np.isnan(composite_score) if isinstance(composite_score, float) else False)
+            
+            # 计算信号置信度
+            signal_confidence = self._calculate_signal_confidence(strength_result, emotion_result)
             
             etf_analysis[symbol] = {
                 'name': ETF_POOL[symbol],
                 'strength': strength_result,
                 'emotion': emotion_result,
                 'composite_score': composite_score,
+                'score_valid': score_valid,  # 新增：标记得分是否有效
+                'signal_confidence': signal_confidence,
                 'cap_type': 'large' if symbol in LARGE_CAP_ETFS else ('small' if symbol in SMALL_CAP_ETFS else 'sector')
             }
         
@@ -86,8 +107,8 @@ class HedgeStrategy:
         portfolio['cash_ratio'] = self._calculate_cash_ratio(etf_analysis)
         
         # 计算市场环境
-        market_regime = self._calculate_market_regime(etf_analysis)
-        portfolio['market_regime'] = market_regime
+        market_regime_calc = self._calculate_market_regime(etf_analysis)
+        portfolio['market_regime_calc'] = market_regime_calc
         
         # 排序选择
         sorted_etfs = sorted(
@@ -96,7 +117,7 @@ class HedgeStrategy:
             reverse=True
         )
         
-        # 选择多头持仓
+        # 选择多头持仓（增加置信度过滤）
         long_positions = self._select_long_positions(sorted_etfs, etf_analysis)
         portfolio['long_positions'] = long_positions
         
@@ -135,6 +156,9 @@ class HedgeStrategy:
         - 疯狂期不再一刀切惩罚，区分"强势疯狂"和"衰竭疯狂"
         - 增加趋势确认因子
         
+        优化v3：
+        - P2：商品类资产使用纯趋势得分，不使用情绪周期
+        
         综合考虑：
         - 强弱信号得分（权重45%）
         - 情绪阶段（权重25%）
@@ -144,15 +168,38 @@ class HedgeStrategy:
         # 强弱得分（-5到5映射到-1到1）
         strength_score = strength['score'] / 5
         
-        # 情绪阶段得分（优化：疯狂期惩罚力度降低）
-        phase = emotion['phase']
-        phase_strength = emotion.get('phase_strength', 0.5)
-        rsi = emotion.get('rsi', 50)
-        
         # 获取趋势信息
         trend_info = strength.get('trend', {})
         trend_direction = trend_info.get('direction', 'unknown')
         trend_confirmed = trend_info.get('confirmed', False)
+        
+        # === P2优化：商品类资产使用纯趋势得分 ===
+        symbol = strength.get('symbol', '')
+        if symbol in NO_DESPAIR_BUY_ASSETS:
+            # 商品类资产：纯趋势跟踪，不使用情绪周期
+            trend_bonus = 0
+            if trend_direction == 'uptrend':
+                trend_bonus = 0.6 if trend_confirmed else 0.3
+            elif trend_direction == 'downtrend':
+                trend_bonus = -0.6 if trend_confirmed else -0.3
+            
+            # 简化得分：强弱信号 + 趋势
+            composite = strength_score * 0.6 + trend_bonus * 0.4
+            
+            # 市场环境调整
+            if self.market_regime:
+                regime = self.market_regime.get('regime', 'unknown')
+                if regime == 'bear' and composite > 0:
+                    composite *= 0.7
+                elif regime == 'bull' and composite < 0:
+                    composite *= 0.8
+            
+            return composite
+        
+        # 情绪阶段得分（优化：疯狂期惩罚力度降低）
+        phase = emotion['phase']
+        phase_strength = emotion.get('phase_strength', 0.5)
+        rsi = emotion.get('rsi', 50)
         
         # 动态计算情绪阶段得分
         if phase == 'despair':
@@ -216,11 +263,76 @@ class HedgeStrategy:
             despair_bonus                      # 绝望期加成
         )
         
-        # 确保深度绝望期的ETF能获得足够高的分数
+        # 市场环境调整
+        if self.market_regime:
+            regime = self.market_regime.get('regime', 'unknown')
+            if regime == 'bear':
+                # 熊市环境：降低买入信号得分
+                if composite > 0:
+                    composite *= 0.7
+            elif regime == 'bull':
+                # 牛市环境：降低卖出信号惩罚
+                if composite < 0:
+                    composite *= 0.8
+        
+        # 确保深度绝望期的ETF能获得足够高的分数（但熊市除外）
         if phase == 'despair' and despair_bonus > 0.3:
-            composite = max(composite, 0.4)
+            if self.market_regime is None or self.market_regime.get('regime') != 'bear':
+                composite = max(composite, 0.4)
         
         return composite
+    
+    def _calculate_signal_confidence(self, strength: Dict, emotion: Dict) -> float:
+        """
+        计算信号综合置信度
+        
+        高置信度条件：
+        1. 强弱信号和情绪阶段一致
+        2. 趋势确认
+        3. 多个技术指标共振
+        
+        Returns:
+            置信度 0-1
+        """
+        confidence = 0.5  # 基础置信度
+        
+        signal = strength['signal']
+        phase = emotion['phase']
+        trend = strength.get('trend', {})
+        strength_confidence = strength.get('confidence', 'medium')
+        
+        # 信号和情绪一致性
+        if signal in ['strong_buy', 'buy'] and phase == 'despair':
+            confidence += 0.2
+        elif signal in ['strong_sell', 'sell'] and phase == 'frenzy':
+            confidence += 0.2
+        elif signal == 'neutral' and phase == 'hesitation':
+            confidence += 0.1
+        
+        # 趋势确认
+        if trend.get('confirmed'):
+            if (signal in ['strong_buy', 'buy'] and trend['direction'] == 'uptrend') or \
+               (signal in ['strong_sell', 'sell'] and trend['direction'] == 'downtrend'):
+                confidence += 0.15
+            elif (signal in ['strong_buy', 'buy'] and trend['direction'] == 'downtrend') or \
+                 (signal in ['strong_sell', 'sell'] and trend['direction'] == 'uptrend'):
+                confidence -= 0.2  # 逆势信号降低置信度
+        
+        # 强弱分析自身置信度
+        if strength_confidence == 'high':
+            confidence += 0.1
+        elif strength_confidence == 'low':
+            confidence -= 0.1
+        
+        # 市场环境调整
+        if self.market_regime:
+            regime = self.market_regime.get('regime', 'unknown')
+            if regime == 'bear' and signal in ['strong_buy', 'buy']:
+                confidence -= 0.15  # 熊市买入信号降低置信度
+            elif regime == 'bull' and signal in ['strong_sell', 'sell']:
+                confidence -= 0.1  # 牛市卖出信号降低置信度
+        
+        return max(0.1, min(1.0, confidence))
     
     def _calculate_cash_ratio(self, etf_analysis: Dict) -> float:
         """
@@ -290,44 +402,71 @@ class HedgeStrategy:
         """
         选择多头持仓
         
-        纯按综合得分排序，不考虑分类限制
+        优化：
+        - 增加置信度过滤
+        - 市场环境调整门槛
+        - P0：过滤nan得分
+        - P0：禁止特定资产绝望期抄底
         """
         long_positions = []
         max_positions = 6  # 最多6个多头
-        min_score = 0.35  # 最低得分门槛
+        
+        # 根据市场环境调整门槛
+        if self.market_regime and self.market_regime.get('regime') == 'bear':
+            min_score = 0.45  # 熊市提高门槛
+            min_confidence = 0.5  # 熊市要求更高置信度
+        else:
+            min_score = 0.35  # 正常门槛
+            min_confidence = 0.4  # 正常置信度要求
         
         # 按综合得分降序排列
         sorted_by_score = sorted(
             sorted_etfs,
-            key=lambda x: x[1]['composite_score'],
+            key=lambda x: x[1]['composite_score'] if x[1].get('score_valid', True) else -999,
             reverse=True
         )
         
-        # 选择得分最高的前N个（得分>门槛）
+        # 选择得分最高的前N个（得分>门槛 且 置信度>门槛）
         for symbol, analysis in sorted_by_score:
             if len(long_positions) >= max_positions:
                 break
             
+            # === P0优化：跳过nan得分 ===
+            if not analysis.get('score_valid', True):
+                continue
+            
             composite_score = analysis['composite_score']
+            signal_confidence = analysis.get('signal_confidence', 0.5)
             cap_type = analysis['cap_type']
+            phase = analysis['emotion']['phase']
+            
+            # === P0优化：禁止特定资产绝望期抄底 ===
+            if symbol in NO_DESPAIR_BUY_ASSETS and phase == 'despair':
+                continue  # 这些资产不参与绝望期推荐
             
             # 只选择得分超过门槛的
             if composite_score <= min_score:
                 continue
             
-            # 计算权重（根据得分动态调整）
+            # 置信度过滤
+            if signal_confidence < min_confidence:
+                continue
+            
+            # 计算权重（根据得分和置信度动态调整）
+            base_weight = 0.15
             if composite_score > 0.6:
-                weight = 0.25
+                base_weight = 0.25
             elif composite_score > 0.45:
-                weight = 0.20
-            else:
-                weight = 0.15
+                base_weight = 0.20
+            
+            # 置信度调整权重
+            weight = base_weight * (0.7 + 0.3 * signal_confidence)
             
             # 构建理由
             reasons = []
             if analysis['strength']['signal'] in ['strong_buy', 'buy']:
                 reasons.append(f"强弱信号:{analysis['strength']['signal']}")
-            if analysis['emotion']['phase'] == 'despair':
+            if phase == 'despair':
                 reasons.append("处于绝望期")
             reasons.extend(analysis['strength'].get('reasons', [])[:2])
             
@@ -350,6 +489,11 @@ class HedgeStrategy:
         - 强势疯狂：趋势强劲+高RSI，可能继续上涨，不应回避
         - 衰竭疯狂：趋势衰竭+高RSI+量能萎缩，才应回避
         
+        优化v3：
+        - P0：过滤nan得分，不参与回避推荐
+        - P0：趋势性资产（纳指/印度ETF）恐慌期不发卖出信号
+        - P1：牛市环境下"上涨缩量"不作为回避理由
+        
         说明：这里的"对冲"是指识别出应该回避或减配的标的，
         而非做空。普通投资者可以：
         1. 不配置这些标的
@@ -362,10 +506,17 @@ class HedgeStrategy:
         # 这些品种即使处于疯狂期，也可能继续上涨，需要更严格的回避条件
         defensive_symbols = {'515450', '512800', '515180'}  # 红利低波50、银行ETF、红利ETF
         
+        # 判断是否为牛市环境
+        is_bull_market = self.market_regime and self.market_regime.get('regime') == 'bull'
+        
         # 从最弱的开始选
         for symbol, analysis in reversed(sorted_etfs):
             if len(hedge_positions) >= 2:  # 最多2个
                 break
+            
+            # === P0优化：跳过nan得分 ===
+            if not analysis.get('score_valid', True):
+                continue
             
             composite_score = analysis['composite_score']
             emotion = analysis['emotion']
@@ -373,9 +524,32 @@ class HedgeStrategy:
             phase = emotion['phase']
             rsi = emotion.get('rsi', 50)
             
+            # === P0优化：趋势性资产恐慌期保护 ===
+            if symbol in SPECIAL_ASSET_RULES:
+                asset_rules = SPECIAL_ASSET_RULES[symbol]
+                if asset_rules.get('avoid_short_in_panic', False):
+                    panic_threshold = asset_rules.get('panic_rsi_threshold', 25)
+                    # 如果RSI低于恐慌阈值，不发回避信号（可能是V型反转机会）
+                    if rsi < panic_threshold:
+                        continue
+                    # 如果处于绝望期，也不发回避信号
+                    if phase == 'despair':
+                        continue
+            
             # 基础门槛：只选择负分的
             if composite_score >= -0.2:
                 continue
+            
+            # === P1优化：牛市环境下"上涨缩量"不作为回避理由 ===
+            reasons_list = strength.get('reasons', [])
+            if is_bull_market:
+                # 如果唯一的负面理由是"上涨缩量"，则跳过
+                negative_reasons = [r for r in reasons_list if '缩量' in r or '买盘不足' in r]
+                other_negative_reasons = [r for r in reasons_list if r not in negative_reasons and 
+                                         ('顶背离' in r or '超买' in r or '卖出' in r)]
+                if negative_reasons and not other_negative_reasons:
+                    # 只有缩量相关的负面理由，牛市中跳过
+                    continue
             
             # === 优化：区分强势疯狂 vs 衰竭疯狂 ===
             if phase == 'frenzy':

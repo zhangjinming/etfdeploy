@@ -153,6 +153,10 @@ def verify_predictions_for_date(fetcher: ETFDataFetcher, predictions: list,
     """
     验证指定日期的所有预测
     
+    优化：短周期验证失败则跳过长周期验证
+    - 1个月验证失败 → 跳过2个月、3个月验证
+    - 2个月验证失败 → 跳过3个月验证
+    
     Args:
         fetcher: 数据获取器
         predictions: 预测列表
@@ -176,7 +180,28 @@ def verify_predictions_for_date(fetcher: ETFDataFetcher, predictions: list,
         
         print(f"\n  📊 {name}({symbol}) - {pred_type} [{signal}]")
         
+        # 记录该ETF是否已验证失败，失败后跳过后续周期
+        failed_at_period = None
+        
         for period_name, days in verify_periods:
+            # 优化：如果前一个周期验证失败，跳过后续验证
+            if failed_at_period is not None:
+                print(f"     {period_name}: ⏭️ 跳过验证 | {failed_at_period}已失败，需调整策略")
+                # 记录跳过信息
+                skip_detail = {
+                    'symbol': symbol,
+                    'name': name,
+                    'signal': signal,
+                    'type': pred_type,
+                    'price_change': None,
+                    'match': None,
+                    'reason': f'{failed_at_period}验证失败，跳过后续验证',
+                    'skipped': True,
+                    'skipped_reason': failed_at_period
+                }
+                verification_summary[period_name].append(skip_detail)
+                continue
+            
             price_change = get_future_price_change(fetcher, symbol, tuesday, days)
             verify_result = verify_prediction(signal, price_change)
             
@@ -188,7 +213,8 @@ def verify_predictions_for_date(fetcher: ETFDataFetcher, predictions: list,
                 'type': pred_type,
                 'price_change': price_change,
                 'match': verify_result['match'],
-                'reason': verify_result['reason']
+                'reason': verify_result['reason'],
+                'skipped': False
             }
             
             if verify_result['match'] is None:
@@ -199,9 +225,15 @@ def verify_predictions_for_date(fetcher: ETFDataFetcher, predictions: list,
             else:
                 status = '❌ 不符合预期'
                 verification_summary[period_name].append(verify_detail)
+                # 标记验证失败，后续周期将跳过
+                failed_at_period = period_name
             
             change_str = f"{price_change:+.1f}%" if price_change is not None else "N/A"
             print(f"     {period_name}: {status} | 涨跌: {change_str} | {verify_result['reason']}")
+            
+            # 如果验证失败，提示需要策略调整
+            if failed_at_period:
+                print(f"     ⚠️ 策略失效提示: {name}在{period_name}验证失败，后续周期不再验证，建议调整策略")
     
     return verification_summary
 
@@ -210,6 +242,8 @@ def print_verification_summary(all_results: list):
     """
     打印验证汇总报告
     
+    优化：统计跳过的验证，区分有效验证和跳过验证
+    
     Args:
         all_results: 所有分析结果列表
     """
@@ -217,9 +251,11 @@ def print_verification_summary(all_results: list):
     print("【总体验证汇总】")
     print("=" * 80)
     
-    total_summary = {'1个月': {'correct': 0, 'total': 0}, 
-                     '2个月': {'correct': 0, 'total': 0}, 
-                     '3个月': {'correct': 0, 'total': 0}}
+    total_summary = {
+        '1个月': {'correct': 0, 'total': 0, 'skipped': 0}, 
+        '2个月': {'correct': 0, 'total': 0, 'skipped': 0}, 
+        '3个月': {'correct': 0, 'total': 0, 'skipped': 0}
+    }
     
     for result in all_results:
         date = result['simulate_date']
@@ -230,21 +266,36 @@ def print_verification_summary(all_results: list):
         for period_name in ['1个月', '2个月', '3个月']:
             results_list = verification.get(period_name, [])
             if results_list:
-                correct = sum(1 for r in results_list if r['match'])
-                total = len(results_list)
+                # 区分有效验证和跳过的验证
+                valid_results = [r for r in results_list if not r.get('skipped', False)]
+                skipped_results = [r for r in results_list if r.get('skipped', False)]
+                
+                correct = sum(1 for r in valid_results if r['match'])
+                total = len(valid_results)
+                skipped = len(skipped_results)
+                
                 accuracy = correct / total * 100 if total > 0 else 0
                 total_summary[period_name]['correct'] += correct
                 total_summary[period_name]['total'] += total
-                print(f"   {period_name}: {correct}/{total} 符合预期 ({accuracy:.0f}%)")
+                total_summary[period_name]['skipped'] += skipped
+                
+                skip_info = f", 跳过{skipped}个" if skipped > 0 else ""
+                print(f"   {period_name}: {correct}/{total} 符合预期 ({accuracy:.0f}%){skip_info}")
                 
                 # 显示验证错误的ETF详情
-                failed_items = [r for r in results_list if not r['match']]
+                failed_items = [r for r in valid_results if r['match'] is False]
                 if failed_items:
                     print(f"      ❌ 验证失败:")
                     for item in failed_items:
                         signal_desc = '买入' if item['signal'] in ['buy', 'strong_buy'] else '回避'
                         change_str = f"{item['price_change']:+.1f}%" if item['price_change'] is not None else "N/A"
                         print(f"         - {item['name']}({item['symbol']}): {signal_desc}信号, 实际涨跌{change_str}, {item['reason']}")
+                
+                # 显示跳过的验证
+                if skipped_results:
+                    print(f"      ⏭️ 跳过验证（前期已失败）:")
+                    for item in skipped_results:
+                        print(f"         - {item['name']}({item['symbol']}): {item.get('skipped_reason', '前期')}失败")
     
     # 总体准确率
     print(f"\n{'=' * 80}")
@@ -254,6 +305,17 @@ def print_verification_summary(all_results: list):
     for period_name in ['1个月', '2个月', '3个月']:
         correct = total_summary[period_name]['correct']
         total = total_summary[period_name]['total']
+        skipped = total_summary[period_name]['skipped']
         accuracy = correct / total * 100 if total > 0 else 0
         bar = '█' * int(accuracy / 5) + '░' * (20 - int(accuracy / 5))
-        print(f"  {period_name}: [{bar}] {accuracy:.1f}% ({correct}/{total})")
+        skip_info = f" (跳过{skipped})" if skipped > 0 else ""
+        print(f"  {period_name}: [{bar}] {accuracy:.1f}% ({correct}/{total}){skip_info}")
+    
+    # 新增：策略调整建议
+    total_failed_1m = sum(
+        1 for r in all_results 
+        for v in r.get('verification', {}).get('1个月', [])
+        if v.get('match') is False and not v.get('skipped', False)
+    )
+    if total_failed_1m > 0:
+        print(f"\n⚠️ 策略调整建议: 共有{total_failed_1m}个预测在1个月内验证失败，建议复盘调整策略参数")

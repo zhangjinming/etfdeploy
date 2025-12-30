@@ -2,13 +2,13 @@
 策略一：强弱分析法
 核心逻辑：该涨不涨看跌，该跌不跌看涨
 优化：采用周线级别分析，减少日线噪音
-新增：趋势确认因子，特殊资产处理
+新增：趋势确认因子，特殊资产处理，信号置信度
 """
 
 import pandas as pd
 import numpy as np
 from typing import Dict
-from config import SPECIAL_ASSETS
+from config import SPECIAL_ASSETS, SIGNAL_THRESHOLDS, SPECIAL_ASSET_OVERBOUGHT, SPECIAL_ASSET_RULES
 
 
 class StrengthWeaknessAnalyzer:
@@ -198,12 +198,16 @@ class StrengthWeaknessAnalyzer:
         
         对于黄金、美股、商品等与A股相关性低的资产，
         使用趋势跟踪而非逆向策略
+        
+        优化：增加超买过滤，避免在极端位置追高
+        P0优化：恐慌期保护，避免在极端低位发出卖出信号
         """
         df = self.df
         if len(df) < 12:
             return {
                 'signal': 'neutral',
                 'score': 0,
+                'confidence': 'low',
                 'reasons': ['数据不足'],
                 'rsi': 50,
                 'price_position': 0.5,
@@ -216,54 +220,107 @@ class StrengthWeaknessAnalyzer:
         
         score = 0
         reasons = []
+        confidence = 'medium'  # 默认中等置信度
         
-        # 趋势跟踪核心逻辑
-        if trend['direction'] == 'uptrend':
-            if trend['confirmed']:
-                score += 3
-                reasons.append("趋势向上确认")
-            else:
-                score += 1
-                reasons.append("趋势偏多")
+        # 获取超买阈值
+        rsi_extreme = SPECIAL_ASSET_OVERBOUGHT['rsi_extreme']
+        rsi_high = SPECIAL_ASSET_OVERBOUGHT['rsi_high']
+        max_score_overbought = SPECIAL_ASSET_OVERBOUGHT['max_score_when_overbought']
+        
+        current_rsi = latest['rsi']
+        
+        # === P0优化：获取特殊资产规则 ===
+        asset_rules = SPECIAL_ASSET_RULES.get(self.symbol, {})
+        avoid_short_in_panic = asset_rules.get('avoid_short_in_panic', False)
+        panic_rsi_threshold = asset_rules.get('panic_rsi_threshold', 25)
+        
+        # === P0优化：恐慌期保护 ===
+        is_in_panic = current_rsi < panic_rsi_threshold
+        if is_in_panic and avoid_short_in_panic:
+            # 恐慌期不发卖出信号，可能是V型反转机会
+            reasons.append(f"RSI={current_rsi:.1f}处于恐慌区域，暂不做空")
+            # 即使趋势向下，也不给负分
+            score = max(score, 0)
+            confidence = 'low'
             
-            # 回调买入机会
-            if latest['bb_position'] < 0.4 and latest['rsi'] < 50:
-                score += 1
-                reasons.append("上升趋势中回调")
+            # 检查是否有反弹迹象
+            if len(df) >= 3:
+                recent_change = (df['close'].iloc[-1] / df['close'].iloc[-2] - 1) * 100
+                if recent_change > 0:
+                    score += 1
+                    reasons.append("恐慌后出现反弹")
+        
+        # === 新增：超买过滤 ===
+        is_overbought = current_rsi > rsi_high
+        is_extreme_overbought = current_rsi > rsi_extreme
+        
+        if is_extreme_overbought:
+            # 极度超买，即使趋势向上也不追高
+            score = min(score, max_score_overbought)
+            reasons.append(f"RSI={current_rsi:.1f}极度超买，暂不追高")
+            confidence = 'low'
+        elif is_overbought:
+            # 高位超买，降低买入信号强度
+            reasons.append(f"RSI={current_rsi:.1f}处于高位")
+        
+        # 趋势跟踪核心逻辑（受超买限制和恐慌保护）
+        if not is_extreme_overbought and not (is_in_panic and avoid_short_in_panic):
+            if trend['direction'] == 'uptrend':
+                if trend['confirmed']:
+                    if not is_overbought:
+                        score += 3
+                        reasons.append("趋势向上确认")
+                        confidence = 'high'
+                    else:
+                        score += 1  # 超买时降低得分
+                        reasons.append("趋势向上但高位")
+                else:
+                    score += 1
+                    reasons.append("趋势偏多")
                 
-        elif trend['direction'] == 'downtrend':
-            if trend['confirmed']:
-                score -= 3
-                reasons.append("趋势向下确认")
+                # 回调买入机会（非超买时）
+                if latest['bb_position'] < 0.4 and current_rsi < 50:
+                    score += 1
+                    reasons.append("上升趋势中回调")
+                    confidence = 'high'
+                    
+            elif trend['direction'] == 'downtrend':
+                # P0优化：恐慌期不发卖出信号
+                if not (is_in_panic and avoid_short_in_panic):
+                    if trend['confirmed']:
+                        score -= 3
+                        reasons.append("趋势向下确认")
+                        confidence = 'high'
+                    else:
+                        score -= 1
+                        reasons.append("趋势偏空")
+                    
+                    # 反弹卖出机会
+                    if latest['bb_position'] > 0.6 and current_rsi > 50:
+                        score -= 1
+                        reasons.append("下降趋势中反弹")
             else:
-                score -= 1
-                reasons.append("趋势偏空")
-            
-            # 反弹卖出机会
-            if latest['bb_position'] > 0.6 and latest['rsi'] > 50:
-                score -= 1
-                reasons.append("下降趋势中反弹")
-        else:
-            reasons.append("趋势不明")
+                reasons.append("趋势不明")
+                confidence = 'low'
         
         # 动量确认
         momentum = latest.get('momentum', 0)
         if pd.notna(momentum):
-            if momentum > 0.08:
+            if momentum > 0.08 and not is_overbought:
                 score += 1
                 reasons.append("动量强劲")
-            elif momentum < -0.08:
+            elif momentum < -0.08 and not (is_in_panic and avoid_short_in_panic):
                 score -= 1
                 reasons.append("动量疲弱")
         
-        # 判断信号（特殊资产提高阈值，需要更强趋势确认）
-        if score >= 4:
+        # 判断信号（使用配置的阈值）
+        if score >= SIGNAL_THRESHOLDS['strong_buy']:
             signal = 'strong_buy'
-        elif score >= 2:
+        elif score >= SIGNAL_THRESHOLDS['buy']:
             signal = 'buy'
-        elif score <= -4:
+        elif score <= SIGNAL_THRESHOLDS['strong_sell']:
             signal = 'strong_sell'
-        elif score <= -2:
+        elif score <= SIGNAL_THRESHOLDS['sell']:
             signal = 'sell'
         else:
             signal = 'neutral'
@@ -275,14 +332,20 @@ class StrengthWeaknessAnalyzer:
         return {
             'signal': signal,
             'score': score,
+            'confidence': confidence,
             'reasons': reasons,
-            'rsi': latest['rsi'],
+            'rsi': current_rsi,
             'price_position': price_position,
             'bb_position': latest['bb_position'],
             'momentum': latest.get('momentum', 0),
             'weekly_mode': self.use_weekly,
             'is_special': True,
-            'trend': trend
+            'trend': trend,
+            'is_overbought': is_overbought,
+            'is_extreme_overbought': is_extreme_overbought,
+            'is_in_panic': is_in_panic,  # P0新增
+            'panic_protected': is_in_panic and avoid_short_in_panic,  # P0新增
+            'symbol': self.symbol  # 新增：传递symbol用于商品类资产识别
         }
 
     def analyze_strength(self) -> Dict:
@@ -444,28 +507,35 @@ class StrengthWeaknessAnalyzer:
                 score -= 1
                 reasons.append("顺势做空")
         
-        # 判断信号（提高阈值，减少误判）
-        if score >= 5:
+        # 判断信号（使用配置的阈值，减少误判）
+        if score >= SIGNAL_THRESHOLDS['strong_buy']:
             signal = 'strong_buy'
-        elif score >= 3:
+            confidence = 'high' if trend['confirmed'] and trend['direction'] != 'downtrend' else 'medium'
+        elif score >= SIGNAL_THRESHOLDS['buy']:
             signal = 'buy'
-        elif score <= -5:
+            confidence = 'medium' if trend['direction'] != 'downtrend' else 'low'
+        elif score <= SIGNAL_THRESHOLDS['strong_sell']:
             signal = 'strong_sell'
-        elif score <= -3:
+            confidence = 'high' if trend['confirmed'] and trend['direction'] != 'uptrend' else 'medium'
+        elif score <= SIGNAL_THRESHOLDS['sell']:
             signal = 'sell'
+            confidence = 'medium' if trend['direction'] != 'uptrend' else 'low'
         else:
             signal = 'neutral'
+            confidence = 'medium'
         
         return {
             'signal': signal,
             'score': score,
+            'confidence': confidence,
             'reasons': reasons,
             'rsi': latest['rsi'],
             'price_position': price_position,
             'bb_position': latest['bb_position'],
             'momentum': latest.get('momentum', 0),
             'weekly_mode': self.use_weekly,
-            'trend': trend  # 新增趋势信息
+            'trend': trend,  # 新增趋势信息
+            'symbol': self.symbol  # 新增：传递symbol用于商品类资产识别
         }
     
     def get_daily_confirmation(self) -> Dict:

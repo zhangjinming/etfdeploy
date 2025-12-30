@@ -378,17 +378,19 @@ class MarkdownReportGenerator:
         lines.append("## 📈 总体准确率\n")
         total_summary = self._calculate_total_accuracy(all_results)
         
-        lines.append("| 验证周期 | 准确率 | 正确/总数 | 进度条 |")
-        lines.append("|----------|--------|-----------|--------|")
+        lines.append("| 验证周期 | 准确率 | 正确/总数 | 跳过 | 进度条 |")
+        lines.append("|----------|--------|-----------|------|--------|")
         
         for period_name in ['1个月', '2个月', '3个月']:
-            stats = total_summary.get(period_name, {'correct': 0, 'total': 0})
+            stats = total_summary.get(period_name, {'correct': 0, 'total': 0, 'skipped': 0})
             correct = stats['correct']
             total = stats['total']
+            skipped = stats.get('skipped', 0)
             accuracy = correct / total * 100 if total > 0 else 0
             progress = int(accuracy / 5)
             bar = '█' * progress + '░' * (20 - progress)
-            lines.append(f"| {period_name} | **{accuracy:.1f}%** | {correct}/{total} | `{bar}` |")
+            skip_str = str(skipped) if skipped > 0 else "-"
+            lines.append(f"| {period_name} | **{accuracy:.1f}%** | {correct}/{total} | {skip_str} | `{bar}` |")
         
         lines.append("\n---\n")
         
@@ -491,12 +493,16 @@ class MarkdownReportGenerator:
                     if results_list:
                         # 支持两种格式：布尔值列表或字典列表
                         if isinstance(results_list[0], dict):
-                            correct = sum(1 for r in results_list if r.get('match'))
+                            # 排除跳过的验证
+                            valid_results = [r for r in results_list if not r.get('skipped', False)]
+                            correct = sum(1 for r in valid_results if r.get('match'))
+                            total = len(valid_results)
                         else:
                             correct = sum(1 for r in results_list if r)
-                        total = len(results_list)
-                        acc = correct / total * 100 if total > 0 else 0
-                        lines.append(f"| {period} | {correct} | {total} | {acc:.0f}% |")
+                            total = len(results_list)
+                        if total > 0:
+                            acc = correct / total * 100
+                            lines.append(f"| {period} | {correct} | {total} | {acc:.0f}% |")
                 
                 # 添加验证失败详情
                 failed_details = []
@@ -504,7 +510,17 @@ class MarkdownReportGenerator:
                     results_list = verification.get(period, [])
                     if results_list and isinstance(results_list[0], dict):
                         for r in results_list:
-                            if not r.get('match'):
+                            # 跳过的验证也显示在失败详情中
+                            if r.get('skipped', False):
+                                failed_details.append({
+                                    'period': period,
+                                    'name': r.get('name', ''),
+                                    'symbol': r.get('symbol', ''),
+                                    'signal_desc': '买入信号' if r.get('signal') in ['buy', 'strong_buy'] else '回避信号',
+                                    'change': 'N/A',
+                                    'reason': r.get('reason', '')
+                                })
+                            elif not r.get('match'):
                                 signal_desc = '买入信号' if r.get('signal') in ['buy', 'strong_buy'] else '回避信号'
                                 change_str = f"{r.get('price_change', 0):+.1f}%" if r.get('price_change') is not None else "N/A"
                                 failed_details.append({
@@ -532,11 +548,14 @@ class MarkdownReportGenerator:
         return '\n'.join(lines)
     
     def _calculate_total_accuracy(self, all_results: List[Dict]) -> Dict:
-        """计算总体准确率"""
+        """计算总体准确率
+        
+        优化：排除跳过的验证，只统计有效验证
+        """
         total_summary = {
-            '1个月': {'correct': 0, 'total': 0},
-            '2个月': {'correct': 0, 'total': 0},
-            '3个月': {'correct': 0, 'total': 0}
+            '1个月': {'correct': 0, 'total': 0, 'skipped': 0},
+            '2个月': {'correct': 0, 'total': 0, 'skipped': 0},
+            '3个月': {'correct': 0, 'total': 0, 'skipped': 0}
         }
         
         for result in all_results:
@@ -546,10 +565,16 @@ class MarkdownReportGenerator:
                 if results_list:
                     # 支持两种格式：布尔值列表或字典列表
                     if isinstance(results_list[0], dict):
-                        correct = sum(1 for r in results_list if r.get('match'))
+                        # 区分有效验证和跳过的验证
+                        valid_results = [r for r in results_list if not r.get('skipped', False)]
+                        skipped_results = [r for r in results_list if r.get('skipped', False)]
+                        correct = sum(1 for r in valid_results if r.get('match'))
+                        total_summary[period_name]['correct'] += correct
+                        total_summary[period_name]['total'] += len(valid_results)
+                        total_summary[period_name]['skipped'] += len(skipped_results)
                     else:
                         correct = sum(1 for r in results_list if r)
-                    total_summary[period_name]['correct'] += correct
-                    total_summary[period_name]['total'] += len(results_list)
+                        total_summary[period_name]['correct'] += correct
+                        total_summary[period_name]['total'] += len(results_list)
         
         return total_summary

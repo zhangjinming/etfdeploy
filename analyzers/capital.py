@@ -277,6 +277,8 @@ class CapitalFlowAnalyzer:
         - 大盘股领涨
         - 换手率适中
         - 资金效率高
+        
+        优化：增加风格调整建议
         """
         style_result = self.analyze_style_rotation()
         
@@ -285,17 +287,20 @@ class CapitalFlowAnalyzer:
         
         health_score = 0
         factors = []
+        allocation_adjustment = {}  # 新增：配置调整建议
         
         # 1. 风格健康度
         if style_result['style'] == 'large_cap_dominant':
             health_score += 3
             factors.append("大盘股领涨，拉抬性强")
+            allocation_adjustment['large_cap_boost'] = 0.1  # 增配大盘
         elif style_result['style'] == 'balanced':
             health_score += 2
             factors.append("风格均衡")
         else:
             health_score += 1
             factors.append("小盘股领涨，消耗资金")
+            allocation_adjustment['cash_boost'] = 0.05  # 增加现金
         
         # 2. 资金效率
         if style_result['efficiency_ratio'] < 2:
@@ -306,6 +311,7 @@ class CapitalFlowAnalyzer:
             factors.append("资金效率一般")
         else:
             factors.append("资金效率低，消耗大")
+            allocation_adjustment['position_reduce'] = 0.1  # 降低仓位
         
         # 3. 换手率
         if 1 < style_result['turnover_ratio'] < 3:
@@ -313,11 +319,15 @@ class CapitalFlowAnalyzer:
             factors.append("换手率比例正常")
         elif style_result['turnover_ratio'] > 5:
             factors.append("小盘股换手率过高，投机氛围重")
+            allocation_adjustment['small_cap_reduce'] = 0.15  # 减配小盘
         
         # 4. 风格趋势
         if style_result['style_trend'] == 'rotating_to_large':
             health_score += 1
             factors.append("风格向大盘切换，利于指数")
+            allocation_adjustment['trend_follow_large'] = True
+        elif style_result['style_trend'] == 'rotating_to_small':
+            factors.append("风格向小盘切换，注意风险")
         
         # 判断健康等级
         if health_score >= 6:
@@ -339,5 +349,56 @@ class CapitalFlowAnalyzer:
             'max_score': 7,
             'factors': factors,
             'suggestion': suggestion,
+            'allocation_adjustment': allocation_adjustment,
             'style_analysis': style_result
         }
+    
+    def adjust_allocation_by_style(self, base_allocation: Dict, style_result: Dict = None) -> Dict:
+        """
+        根据风格分析调整配置
+        
+        Args:
+            base_allocation: 基础配置 {symbol: weight}
+            style_result: 风格分析结果，为None时自动获取
+        
+        Returns:
+            调整后的配置
+        """
+        if style_result is None:
+            style_result = self.analyze_style_rotation()
+        
+        if 'error' in style_result:
+            return base_allocation
+        
+        adjusted = base_allocation.copy()
+        
+        # 根据资金效率比调整
+        efficiency_ratio = style_result.get('efficiency_ratio', 1)
+        if efficiency_ratio > 3:
+            # 小盘股消耗资金过大，降低整体仓位
+            scale_factor = 0.85
+            for symbol in adjusted:
+                adjusted[symbol] *= scale_factor
+        elif efficiency_ratio > 5:
+            # 极端情况，大幅降低仓位
+            scale_factor = 0.7
+            for symbol in adjusted:
+                adjusted[symbol] *= scale_factor
+        
+        # 根据风格调整大小盘配置
+        style = style_result.get('style', 'balanced')
+        if style == 'large_cap_dominant':
+            # 大盘占优，增配大盘ETF
+            for symbol in adjusted:
+                if symbol in LARGE_CAP_ETFS:
+                    adjusted[symbol] *= 1.1
+                elif symbol in SMALL_CAP_ETFS:
+                    adjusted[symbol] *= 0.9
+        elif style == 'small_cap_dominant':
+            # 小盘占优但消耗资金，谨慎对待
+            if efficiency_ratio > 3:
+                for symbol in adjusted:
+                    if symbol in SMALL_CAP_ETFS:
+                        adjusted[symbol] *= 0.8
+        
+        return adjusted

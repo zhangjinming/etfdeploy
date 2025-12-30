@@ -2,11 +2,12 @@
 策略二：情绪周期分析
 核心逻辑：行情在绝望中产生，犹豫中发展，疯狂中消亡
 优化：多维度指标综合评估，周线级别减少噪音
+新增：阶段转换确认机制，市场环境过滤
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, Optional
 
 
 class EmotionCycleAnalyzer:
@@ -166,7 +167,7 @@ class EmotionCycleAnalyzer:
         
         return emotion
     
-    def get_emotion_phase(self) -> Dict:
+    def get_emotion_phase(self, market_regime: Optional[Dict] = None) -> Dict:
         """
         判断当前情绪阶段
         
@@ -174,7 +175,10 @@ class EmotionCycleAnalyzer:
         犹豫期：情绪指数 -0.3~0.3，RSI 35-65
         疯狂期：情绪指数 > 0.3，RSI>65，价格位置高
         
-        优化：增加核心指标一致性检查，避免矛盾判定
+        优化：
+        - 增加核心指标一致性检查，避免矛盾判定
+        - 增加阶段转换确认机制
+        - 考虑市场环境因素
         """
         df = self.df
         min_periods = 12 if self.use_weekly else 30
@@ -292,6 +296,32 @@ class EmotionCycleAnalyzer:
             frenzy_score += 3
             despair_score -= 2
         
+        # === 新增：阶段转换确认 ===
+        phase_transition = self._detect_phase_transition()
+        
+        # 如果检测到阶段转换，调整得分
+        if phase_transition['transitioning']:
+            if phase_transition['from_phase'] == 'despair' and phase_transition['to_phase'] == 'hesitation':
+                # 绝望→犹豫：需要确认企稳
+                if not phase_transition['confirmed']:
+                    despair_score += 2  # 保持绝望期判定
+            elif phase_transition['from_phase'] == 'hesitation' and phase_transition['to_phase'] == 'frenzy':
+                # 犹豫→疯狂：需要确认加速
+                if not phase_transition['confirmed']:
+                    hesitation_score += 2  # 保持犹豫期判定
+        
+        # === 新增：市场环境调整 ===
+        if market_regime:
+            regime = market_regime.get('regime', 'unknown')
+            if regime == 'bear':
+                # 熊市环境下，提高绝望期判定门槛
+                if despair_score > hesitation_score and despair_score - hesitation_score < 3:
+                    hesitation_score += 2  # 边界情况偏向犹豫期
+            elif regime == 'bull':
+                # 牛市环境下，降低疯狂期判定敏感度
+                if frenzy_score > hesitation_score and frenzy_score - hesitation_score < 3:
+                    hesitation_score += 1  # 边界情况偏向犹豫期
+        
         # 判断阶段
         scores = {
             'despair': max(0, despair_score),
@@ -334,8 +364,104 @@ class EmotionCycleAnalyzer:
             'rsi': latest['rsi'],
             'price_position': price_pos,
             'turnover_zscore': turnover_z,
-            'weekly_mode': self.use_weekly
+            'weekly_mode': self.use_weekly,
+            'phase_transition': phase_transition
         }
+    
+    def _detect_phase_transition(self) -> Dict:
+        """
+        检测情绪阶段转换信号
+        
+        绝望→犹豫：
+        - 连续2周RSI回升
+        - 成交量温和放大
+        - 价格站上5周均线
+        
+        犹豫→疯狂：
+        - RSI突破70
+        - 成交量急剧放大
+        - 价格加速上涨
+        
+        Returns:
+            阶段转换信息
+        """
+        df = self.df
+        if len(df) < 8:
+            return {'transitioning': False, 'from_phase': None, 'to_phase': None, 'confirmed': False}
+        
+        recent_period = 4 if self.use_weekly else 10
+        recent = df.iloc[-recent_period:]
+        prev = df.iloc[-(recent_period*2):-recent_period]
+        
+        if len(prev) < recent_period:
+            return {'transitioning': False, 'from_phase': None, 'to_phase': None, 'confirmed': False}
+        
+        # 计算指标变化
+        recent_rsi = recent['rsi'].mean()
+        prev_rsi = prev['rsi'].mean()
+        rsi_change = recent_rsi - prev_rsi
+        
+        recent_vol = recent['volume'].mean()
+        prev_vol = prev['volume'].mean()
+        vol_change = (recent_vol - prev_vol) / prev_vol if prev_vol > 0 else 0
+        
+        recent_emotion = recent['emotion_index'].mean()
+        prev_emotion = prev['emotion_index'].mean()
+        emotion_change = recent_emotion - prev_emotion
+        
+        # 检测绝望→犹豫转换
+        if prev_rsi < 35 and recent_rsi > prev_rsi:
+            # RSI从超卖区回升
+            confirmed = (
+                rsi_change > 5 and  # RSI明显回升
+                vol_change > 0 and vol_change < 0.5 and  # 成交量温和放大
+                emotion_change > 0.1  # 情绪改善
+            )
+            return {
+                'transitioning': True,
+                'from_phase': 'despair',
+                'to_phase': 'hesitation',
+                'confirmed': confirmed,
+                'rsi_change': rsi_change,
+                'vol_change': vol_change,
+                'emotion_change': emotion_change
+            }
+        
+        # 检测犹豫→疯狂转换
+        if 40 < prev_rsi < 65 and recent_rsi > 70:
+            # RSI突破超买区
+            confirmed = (
+                rsi_change > 10 and  # RSI快速上升
+                vol_change > 0.5 and  # 成交量大幅放大
+                emotion_change > 0.2  # 情绪快速升温
+            )
+            return {
+                'transitioning': True,
+                'from_phase': 'hesitation',
+                'to_phase': 'frenzy',
+                'confirmed': confirmed,
+                'rsi_change': rsi_change,
+                'vol_change': vol_change,
+                'emotion_change': emotion_change
+            }
+        
+        # 检测疯狂→犹豫转换（见顶回落）
+        if prev_rsi > 70 and recent_rsi < prev_rsi:
+            confirmed = (
+                rsi_change < -10 and  # RSI快速下降
+                emotion_change < -0.15  # 情绪降温
+            )
+            return {
+                'transitioning': True,
+                'from_phase': 'frenzy',
+                'to_phase': 'hesitation',
+                'confirmed': confirmed,
+                'rsi_change': rsi_change,
+                'vol_change': vol_change,
+                'emotion_change': emotion_change
+            }
+        
+        return {'transitioning': False, 'from_phase': None, 'to_phase': None, 'confirmed': False}
     
     def get_emotion_trend(self) -> Dict:
         """获取情绪趋势（情绪是在改善还是恶化）"""

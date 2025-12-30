@@ -63,4 +63,5 @@ logs/
 Thumbs.db
 
 # Project specific
+reports/
 .codebuddy/
