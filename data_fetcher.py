@@ -76,7 +76,11 @@ class ETFDataFetcher:
                 adjust='qfq'
             )
             
-            df = df.rename(columns={
+            if df is None or df.empty:
+                return None
+            
+            # 兼容不同版本的akshare列名
+            column_mapping = {
                 '日期': 'date',
                 '开盘': 'open',
                 '收盘': 'close',
@@ -88,7 +92,31 @@ class ETFDataFetcher:
                 '涨跌幅': 'pct_change',
                 '涨跌额': 'change',
                 '换手率': 'turnover'
-            })
+            }
+            
+            # 只重命名存在的列
+            existing_columns = {k: v for k, v in column_mapping.items() if k in df.columns}
+            if existing_columns:
+                df = df.rename(columns=existing_columns)
+            
+            # 检查是否有date列，如果没有则尝试其他可能的列名
+            if 'date' not in df.columns:
+                # 尝试查找日期列
+                date_candidates = ['日期', 'Date', 'DATE', 'trade_date', '交易日期']
+                for col in date_candidates:
+                    if col in df.columns:
+                        df = df.rename(columns={col: 'date'})
+                        break
+                
+                # 如果还是没有date列，检查是否有索引可用
+                if 'date' not in df.columns and df.index.name in ['日期', 'date', 'Date']:
+                    df = df.reset_index()
+                    if '日期' in df.columns:
+                        df = df.rename(columns={'日期': 'date'})
+            
+            if 'date' not in df.columns:
+                print(f"警告: {symbol}数据缺少日期列，可用列: {df.columns.tolist()}")
+                return None
             
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date').reset_index(drop=True)
@@ -109,18 +137,22 @@ class ETFDataFetcher:
             # 获取足够多的历史数据
             start_date = (current_date - timedelta(days=days*2)).strftime('%Y%m%d')
             
+            # 判断需要数据的截止日期：回测模式用模拟日期，否则用今天
+            # 这样回测时如果本地数据已覆盖模拟日期，就不会去网络获取
+            required_end_date = current_date if self.simulate_date else today
+            
             # 检查是否已有内存缓存
             if symbol not in self.raw_data_cache:
                 # 优先从本地CSV加载
                 local_df = self._load_from_local(symbol)
                 
                 if local_df is not None and len(local_df) > 0:
-                    # 检查本地数据是否需要更新（最新日期是否小于今天）
+                    # 检查本地数据是否满足需求
                     latest_date = local_df['date'].max()
-                    if latest_date.date() < today.date():
-                        # 本地数据不是最新，从网络获取增量数据
+                    if latest_date.date() < required_end_date.date():
+                        # 本地数据不够，从网络获取增量数据
                         new_start = (latest_date + timedelta(days=1)).strftime('%Y%m%d')
-                        new_end = today.strftime('%Y%m%d')
+                        new_end = today.strftime('%Y%m%d')  # 网络获取还是用真实今天
                         new_df = self._fetch_from_network(symbol, new_start, new_end)
                         
                         if new_df is not None and len(new_df) > 0:

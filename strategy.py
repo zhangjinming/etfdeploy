@@ -9,7 +9,7 @@ from config import (
     DESPAIR_CONFIRMATION, SIGNAL_THRESHOLDS, NO_DESPAIR_BUY_ASSETS,
     VOLATILITY_FILTER, SPECIAL_ASSETS, SPECIAL_ASSET_RULES,
     COMMODITY_ETF_PARAMS, DESPAIR_SHORT_LIMITS, SIGNAL_STRENGTH_PARAMS,
-    TREND_FOLLOW_ASSETS, TREND_FILTER_PARAMS
+    TREND_FOLLOW_ASSETS, TREND_FILTER_PARAMS, BULL_MARKET_PARAMS
 )
 from data_fetcher import ETFDataFetcher
 from analyzers import StrengthWeaknessAnalyzer, EmotionCycleAnalyzer, CapitalFlowAnalyzer, HedgeStrategy
@@ -414,6 +414,7 @@ class IntegratedETFStrategy:
         8. P0新增：要求跌幅收窄确认
         9. P0新增：基准回撤限制
         10. 【新增】趋势过滤器：熊市减少抄底频率
+        11. 【新增v5】牛市适应性：降低抄底门槛
         
         Returns:
             验证结果
@@ -437,16 +438,30 @@ class IntegratedETFStrategy:
         market = self.get_market_regime()
         volatility = self.get_market_volatility()
         
+        # === 【新增v5】牛市适应性处理 ===
+        is_bull_market = market['regime'] == 'bull'
+        bull_params = BULL_MARKET_PARAMS if BULL_MARKET_PARAMS.get('enable', False) else {}
+        
         # === P0优化：极端波动率或基准回撤过大时停止抄底 ===
         if volatility.get('stop_despair_buy'):
-            result['valid'] = False
-            result['confidence'] = 0
-            result['reasons'].append(f"系统性风险：{volatility.get('description', '极端波动')}")
-            return result
+            # 【优化v5】牛市环境下放宽限制
+            if not is_bull_market:
+                result['valid'] = False
+                result['confidence'] = 0
+                result['reasons'].append(f"系统性风险：{volatility.get('description', '极端波动')}")
+                return result
+            else:
+                result['warnings'].append(f"牛市环境，放宽波动率限制")
+                result['confidence'] *= 0.8
         
         # P0新增：检查基准回撤
         benchmark_drawdown = volatility.get('benchmark_drawdown', 0)
         benchmark_limit = DESPAIR_CONFIRMATION.get('benchmark_max_drawdown', -10)
+        
+        # 【优化v5】牛市环境下放宽基准回撤限制
+        if is_bull_market:
+            benchmark_limit = benchmark_limit * 1.5  # 牛市放宽50%
+        
         if benchmark_drawdown < benchmark_limit:
             result['valid'] = False
             result['confidence'] = 0
@@ -459,8 +474,28 @@ class IntegratedETFStrategy:
         
         bear_restrictions = TREND_FILTER_PARAMS['bear_market_restrictions']
         
+        # 【优化v5】牛市环境下的特殊处理
+        if is_bull_market and bull_params:
+            # 牛市中回调即是机会，降低绝望期抄底门槛
+            result['confidence'] *= bull_params.get('confidence_boost', 1.3)
+            
+            # 牛市RSI阈值放宽
+            rsi = emotion.get('rsi', 50)
+            bull_rsi_threshold = bull_params.get('rsi_oversold_threshold', 40)
+            if rsi < bull_rsi_threshold:
+                result['confidence'] *= 1.2
+                result['reasons'].append(f'牛市回调机会(RSI={rsi:.1f}<{bull_rsi_threshold})')
+            
+            # 牛市中趋势向下也可以考虑抄底（回调买入）
+            if trend_filter['trend_state'] in ['down']:
+                result['confidence'] *= 0.9  # 轻微惩罚
+                result['warnings'].append('牛市回调，可考虑逢低买入')
+            elif trend_filter['trend_state'] == 'strong_down':
+                result['confidence'] *= 0.6  # 较大惩罚
+                result['warnings'].append('牛市深度回调，谨慎抄底')
+        
         # 熊市环境下应用趋势过滤
-        if market['regime'] == 'bear' and bear_restrictions['enable']:
+        elif market['regime'] == 'bear' and bear_restrictions['enable']:
             # 强下跌趋势：禁止抄底
             if not trend_filter['allow_despair_buy']:
                 result['valid'] = False
@@ -522,7 +557,9 @@ class IntegratedETFStrategy:
         
         # 高波动率降低置信度
         if volatility.get('level') == 'high':
-            result['confidence'] *= 0.6
+            # 【优化v5】牛市环境下减轻惩罚
+            penalty = 0.7 if is_bull_market else 0.6
+            result['confidence'] *= penalty
             result['warnings'].append(f"高波动环境({volatility.get('weekly_vol', 0):.1f}%)，抄底需谨慎")
         
         # 检查1：熊市环境下降低置信度
@@ -552,9 +589,14 @@ class IntegratedETFStrategy:
                     result['confidence'] *= 0.8
                     result['warnings'].append('成交量仍较大，可能未到恐慌尾声')
         
-        # 检查3：RSI是否足够低（P0：阈值从30降到25）
+        # 检查3：RSI是否足够低
         rsi = emotion.get('rsi', 50)
-        if rsi < DESPAIR_CONFIRMATION['rsi_threshold']:
+        rsi_threshold = DESPAIR_CONFIRMATION['rsi_threshold']
+        # 【优化v5】牛市环境下放宽RSI阈值
+        if is_bull_market and bull_params:
+            rsi_threshold = bull_params.get('rsi_oversold_threshold', rsi_threshold)
+        
+        if rsi < rsi_threshold:
             result['confidence'] *= 1.1
             result['reasons'].append(f'RSI={rsi:.1f}，深度超卖')
         elif rsi > 40:
@@ -573,7 +615,7 @@ class IntegratedETFStrategy:
         # 【胜率优化】检查5：价格企稳确认（不创新低）
         if DESPAIR_CONFIRMATION.get('require_price_stabilization', True) and self.use_weekly and len(df) >= 30:
             weekly_df = self._convert_to_weekly(df)
-            stabilization_weeks = DESPAIR_CONFIRMATION.get('stabilization_weeks', 3)  # 【胜率优化】从2周增加到3周
+            stabilization_weeks = DESPAIR_CONFIRMATION.get('stabilization_weeks', 3)
             if len(weekly_df) >= stabilization_weeks + 4:
                 # 检查最近N周是否创新低
                 recent_lows = weekly_df['low'].iloc[-stabilization_weeks:]
@@ -581,10 +623,10 @@ class IntegratedETFStrategy:
                 current_low = recent_lows.min()
                 
                 if current_low < prior_low * 0.98:  # 创新低（允许2%误差）
-                    result['confidence'] *= 0.5  # 【胜率优化】惩罚从0.6加重到0.5
+                    result['confidence'] *= 0.5
                     result['warnings'].append('近期创新低，底部未确认')
                 else:
-                    result['confidence'] *= 1.15  # 【胜率优化】奖励从1.1提高到1.15
+                    result['confidence'] *= 1.15
                     result['reasons'].append('价格企稳，未创新低')
         
         # 【胜率优化】检查6：RSI底背离确认
@@ -609,13 +651,13 @@ class IntegratedETFStrategy:
                     rsi_higher_low = rsi_recent.min() > rsi_prior.min()
                     
                     if price_new_low and rsi_higher_low:
-                        result['confidence'] *= 1.3  # 【胜率优化】从1.25提高到1.3
+                        result['confidence'] *= 1.3
                         result['reasons'].append('RSI底背离，反转信号强')
                     elif not price_new_low and rsi_recent.iloc[-1] > 30:
                         result['confidence'] *= 1.1
                         result['reasons'].append('RSI回升，动能改善')
         
-        # 【胜率优化】检查7：反弹确认（新增）
+        # 【优化v5】检查7：反弹确认（牛市适应性调整）
         if DESPAIR_CONFIRMATION.get('require_bounce_confirm', True) and self.use_weekly and len(df) >= 30:
             weekly_df = self._convert_to_weekly(df)
             if len(weekly_df) >= 10:
@@ -624,15 +666,21 @@ class IntegratedETFStrategy:
                 current_price = weekly_df['close'].iloc[-1]
                 bounce_pct = (current_price / recent_low - 1) * 100
                 
-                min_bounce = DESPAIR_CONFIRMATION.get('min_bounce_from_low', 3.0)
+                # 【优化v5】牛市环境下降低反弹确认阈值
+                min_bounce = DESPAIR_CONFIRMATION.get('min_bounce_from_low', 5.0)
+                if is_bull_market and bull_params:
+                    min_bounce = bull_params.get('min_bounce_threshold', min_bounce)
+                
                 if bounce_pct >= min_bounce:
-                    result['confidence'] *= 1.2
+                    result['confidence'] *= 1.3
                     result['reasons'].append(f'从低点反弹{bounce_pct:.1f}%，企稳信号')
-                elif bounce_pct < 0:
-                    result['confidence'] *= 0.5
-                    result['warnings'].append('仍在创新低，不宜抄底')
+                elif bounce_pct < 2:
+                    # 【优化v5】牛市环境下减轻惩罚
+                    penalty = 0.5 if is_bull_market else 0.3
+                    result['confidence'] *= penalty
+                    result['warnings'].append('反弹幅度不足，不宜抄底')
         
-        # 【胜率优化】检查8：更高低点确认（新增）
+        # 【优化v5】检查8：更高低点确认
         if DESPAIR_CONFIRMATION.get('require_higher_low', True) and self.use_weekly and len(df) >= 40:
             weekly_df = self._convert_to_weekly(df)
             if len(weekly_df) >= 12:
@@ -640,43 +688,88 @@ class IntegratedETFStrategy:
                 recent_low = weekly_df['low'].iloc[-4:].min()
                 prior_low = weekly_df['low'].iloc[-8:-4].min()
                 
-                if recent_low > prior_low * 1.01:  # 最近低点高于之前低点1%以上
-                    result['confidence'] *= 1.2
+                higher_low_margin = DESPAIR_CONFIRMATION.get('higher_low_margin', 1.0) / 100
+                if recent_low > prior_low * (1 + higher_low_margin):  # 最近低点高于之前低点
+                    result['confidence'] *= 1.35
                     result['reasons'].append('形成更高低点，底部确认')
-                elif recent_low < prior_low * 0.98:  # 创新低
-                    result['confidence'] *= 0.6
-                    result['warnings'].append('未形成更高低点')
+                elif recent_low < prior_low * 0.98:  # 创新低（收紧到2%）
+                    # 【优化v5】牛市环境下减轻惩罚
+                    penalty = 0.5 if is_bull_market else 0.3
+                    result['confidence'] *= penalty
+                    result['warnings'].append('未形成更高低点，底部未确认')
         
-        # === P0优化：连续N周确认机制（从4周增加到5周） ===
+        # 【优化v5】检查9：周线阳线确认
+        if DESPAIR_CONFIRMATION.get('require_weekly_positive', True) and self.use_weekly and len(df) >= 30:
+            weekly_df = self._convert_to_weekly(df)
+            if len(weekly_df) >= 4:
+                # 检查近4周收阳周数
+                min_positive_count = DESPAIR_CONFIRMATION.get('min_weekly_positive_count', 2)
+                recent_4_weeks = weekly_df.iloc[-4:]
+                positive_weeks = sum(1 for i in range(len(recent_4_weeks)) 
+                                    if recent_4_weeks['close'].iloc[i] > recent_4_weeks['open'].iloc[i])
+                
+                if positive_weeks >= min_positive_count:
+                    result['confidence'] *= 1.25
+                    result['reasons'].append(f'近4周有{positive_weeks}周收阳，企稳信号')
+                elif positive_weeks <= 1:
+                    # 【优化v5】牛市环境下减轻惩罚
+                    penalty = 0.5 if is_bull_market else 0.3
+                    result['confidence'] *= penalty
+                    result['warnings'].append('近4周收阳不足，下跌动能强')
+                else:
+                    result['confidence'] *= 0.7
+                    result['warnings'].append(f'近4周仅{positive_weeks}周收阳，企稳不足')
+        
+        # 【优化v5】检查10：放量阳线确认
+        if DESPAIR_CONFIRMATION.get('require_volume_confirm', True) and self.use_weekly and len(df) >= 30:
+            weekly_df = self._convert_to_weekly(df)
+            if len(weekly_df) >= 5:
+                # 检查最近一周是否放量收阳
+                latest_vol = weekly_df['volume'].iloc[-1]
+                vol_ma = weekly_df['volume'].iloc[-5:-1].mean()
+                vol_ratio = latest_vol / vol_ma if vol_ma > 0 else 1
+                
+                is_positive = weekly_df['close'].iloc[-1] > weekly_df['open'].iloc[-1]
+                volume_surge = DESPAIR_CONFIRMATION.get('volume_surge_ratio', 1.15)
+                
+                if is_positive and vol_ratio >= volume_surge:
+                    result['confidence'] *= 1.3  # 放量阳线，强企稳信号
+                    result['reasons'].append(f'放量阳线(量比{vol_ratio:.1f}x)，资金入场')
+                elif not is_positive:
+                    result['confidence'] *= 0.7
+                    result['warnings'].append('最近一周收阴，企稳不足')
+        
+        # === 【优化v5】连续N周确认机制 ===
         if self.use_weekly and len(df) >= 30:
             weekly_df = self._convert_to_weekly(df)
-            confirm_weeks = DESPAIR_CONFIRMATION.get('consecutive_weeks_confirm', 5)  # 【胜率优化】改为5周
+            confirm_weeks = DESPAIR_CONFIRMATION.get('consecutive_weeks_confirm', 4)
             if len(weekly_df) >= confirm_weeks + 1:
-                # P0新增：检查跌幅收窄确认
+                # 检查跌幅收窄确认
                 if DESPAIR_CONFIRMATION.get('require_decline_slowdown', True):
                     latest_change = (weekly_df['close'].iloc[-1] / weekly_df['close'].iloc[-2] - 1) * 100
                     prev_change = (weekly_df['close'].iloc[-2] / weekly_df['close'].iloc[-3] - 1) * 100
                     
-                    # 跌幅收窄条件：最近一周跌幅 < 前一周跌幅 * 收窄比例
-                    slowdown_ratio = DESPAIR_CONFIRMATION.get('decline_slowdown_ratio', 0.4)  # 【胜率优化】从0.5降到0.4
+                    slowdown_ratio = DESPAIR_CONFIRMATION.get('decline_slowdown_ratio', 0.40)
                     
                     if prev_change < 0:  # 前一周是下跌的
                         if latest_change >= 0:
                             # 已经止跌转涨，好信号
-                            result['confidence'] *= 1.25  # 【胜率优化】从1.2提高到1.25
+                            result['confidence'] *= 1.35
                             result['reasons'].append('止跌转涨，企稳信号明确')
                         elif latest_change > prev_change * slowdown_ratio:
                             # 跌幅收窄
-                            result['confidence'] *= 1.1
+                            result['confidence'] *= 1.15
                             result['reasons'].append(f'跌幅收窄({prev_change:.1f}%→{latest_change:.1f}%)')
                         else:
                             # 跌幅未收窄，继续下跌
-                            result['confidence'] *= 0.4  # 【胜率优化】从0.5加重到0.4
+                            # 【优化v5】牛市环境下减轻惩罚
+                            penalty = 0.5 if is_bull_market else 0.3
+                            result['confidence'] *= penalty
                             result['warnings'].append(f'跌幅未收窄({prev_change:.1f}%→{latest_change:.1f}%)，建议等待')
                     else:
                         # 前一周已经是上涨，检查是否持续企稳
                         if latest_change >= 0:
-                            result['confidence'] *= 1.1
+                            result['confidence'] *= 1.15
                             result['reasons'].append('连续企稳，可考虑建仓')
                 
                 # 检查最近N周是否持续在低位震荡（未继续大幅下跌）
@@ -684,13 +777,16 @@ class IntegratedETFStrategy:
                     (weekly_df['close'].iloc[-i] / weekly_df['close'].iloc[-i-1] - 1) * 100
                     for i in range(1, min(confirm_weeks + 1, len(weekly_df)))
                 ]
-                # 如果最近几周有单周跌幅超过5%，说明还在恐慌中
-                if any(c < -5 for c in recent_changes[:2]):  # 最近2周
-                    result['confidence'] *= 0.5  # 【胜率优化】从0.6加重到0.5
+                # 【优化v5】如果最近几周有单周跌幅超过4%，说明还在恐慌中
+                if any(c < -4 for c in recent_changes[:2]):  # 最近2周
+                    # 【优化v5】牛市环境下减轻惩罚
+                    penalty = 0.5 if is_bull_market else 0.3
+                    result['confidence'] *= penalty
                     result['warnings'].append('近期仍有大幅下跌，恐慌未结束')
         
-        # 最终判断（【胜率优化】提高置信度门槛）
-        if result['confidence'] < 0.6:  # 【胜率优化】从0.5提高到0.6
+        # 【优化v5】最终判断（牛市环境下降低置信度门槛）
+        confidence_threshold = 0.65 if is_bull_market else 0.75
+        if result['confidence'] < confidence_threshold:
             result['valid'] = False
             result['reasons'].append('综合置信度过低')
         

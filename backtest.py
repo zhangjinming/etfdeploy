@@ -20,7 +20,9 @@ from data_fetcher import get_tuesdays_in_range, ETFDataFetcher
 from config import (
     ETF_POOL, RISK_PARAMS, PROFIT_ADD_PARAMS, 
     ETF_SECTORS, SECTOR_LIMITS, CORRELATED_ETF_GROUPS,
-    TREND_FILTER_PARAMS, DESPAIR_CONFIRMATION
+    TREND_FILTER_PARAMS, DESPAIR_CONFIRMATION,
+    STOP_LOSS_COOLDOWN, TREND_FOLLOW_ASSETS, TREND_PRIORITY_CONFIG,
+    TIME_STOP_PARAMS, BULL_MARKET_PARAMS, TREND_STOP_PARAMS
 )
 
 
@@ -132,6 +134,10 @@ class BacktestEngine:
         # 【v2】市场环境状态
         self.market_regime = 'unknown'
         
+        # 【新增】止损冷却记录
+        self.stop_loss_cooldown: Dict[str, dict] = {}  # {symbol: {'date': str, 'count': int}}
+        self.sector_stop_loss_count: Dict[str, int] = {}  # {sector: count}
+        
     def reset(self):
         """重置账户"""
         self.cash = self.initial_capital
@@ -140,6 +146,90 @@ class BacktestEngine:
         self.daily_snapshots = []
         self.analysis_results = []
         self.market_regime = 'unknown'
+        # 【新增】重置冷却记录
+        self.stop_loss_cooldown = {}
+        self.sector_stop_loss_count = {}
+    
+    def check_cooldown(self, symbol: str, current_date: str) -> Tuple[bool, str]:
+        """
+        【新增】检查ETF是否在冷却期内
+        
+        Args:
+            symbol: ETF代码
+            current_date: 当前日期
+            
+        Returns:
+            (是否可以买入, 原因)
+        """
+        if not STOP_LOSS_COOLDOWN.get('enable', False):
+            return True, ""
+        
+        current = datetime.strptime(current_date, '%Y-%m-%d')
+        
+        # 检查同一ETF冷却
+        if symbol in self.stop_loss_cooldown:
+            cooldown_info = self.stop_loss_cooldown[symbol]
+            cooldown_date = datetime.strptime(cooldown_info['date'], '%Y-%m-%d')
+            stop_count = cooldown_info.get('count', 1)
+            
+            # 计算冷却周数（支持递增冷却）
+            base_weeks = STOP_LOSS_COOLDOWN['same_etf_cooldown_weeks']
+            if STOP_LOSS_COOLDOWN.get('cooldown_decay', False):
+                decay_factor = STOP_LOSS_COOLDOWN.get('decay_factor', 1.5)
+                cooldown_weeks = base_weeks * (decay_factor ** (stop_count - 1))
+            else:
+                cooldown_weeks = base_weeks
+            
+            weeks_since = (current - cooldown_date).days / 7
+            if weeks_since < cooldown_weeks:
+                remaining = int(cooldown_weeks - weeks_since)
+                return False, f"止损冷却中(还需{remaining}周)"
+        
+        # 检查板块冷却
+        sector = ETF_SECTORS.get(symbol, 'other')
+        sector_count = self.sector_stop_loss_count.get(sector, 0)
+        max_sector_stop = STOP_LOSS_COOLDOWN.get('max_sector_stop_loss', 2)
+        
+        if sector_count >= max_sector_stop:
+            # 板块连续止损过多，需要检查冷却
+            sector_cooldown_weeks = STOP_LOSS_COOLDOWN['sector_cooldown_weeks']
+            # 找到该板块最近的止损时间
+            latest_sector_stop = None
+            for sym, info in self.stop_loss_cooldown.items():
+                if ETF_SECTORS.get(sym, 'other') == sector:
+                    stop_date = datetime.strptime(info['date'], '%Y-%m-%d')
+                    if latest_sector_stop is None or stop_date > latest_sector_stop:
+                        latest_sector_stop = stop_date
+            
+            if latest_sector_stop:
+                weeks_since = (current - latest_sector_stop).days / 7
+                if weeks_since < sector_cooldown_weeks:
+                    remaining = int(sector_cooldown_weeks - weeks_since)
+                    return False, f"板块冷却中(还需{remaining}周)"
+        
+        return True, ""
+    
+    def record_stop_loss(self, symbol: str, date: str):
+        """
+        【新增】记录止损事件
+        
+        Args:
+            symbol: ETF代码
+            date: 止损日期
+        """
+        if not STOP_LOSS_COOLDOWN.get('enable', False):
+            return
+        
+        # 更新ETF冷却记录
+        if symbol in self.stop_loss_cooldown:
+            self.stop_loss_cooldown[symbol]['count'] += 1
+            self.stop_loss_cooldown[symbol]['date'] = date
+        else:
+            self.stop_loss_cooldown[symbol] = {'date': date, 'count': 1}
+        
+        # 更新板块止损计数
+        sector = ETF_SECTORS.get(symbol, 'other')
+        self.sector_stop_loss_count[sector] = self.sector_stop_loss_count.get(sector, 0) + 1
     
     def get_sector_exposure(self) -> Dict[str, float]:
         """【v2】获取各板块持仓占比"""
@@ -179,6 +269,97 @@ class BacktestEngine:
                         return False
         return True
     
+    def get_trend_asset_priority(self, symbol: str, analysis_result: dict) -> float:
+        """
+        【新增】获取趋势资产优先级得分
+        
+        Args:
+            symbol: ETF代码
+            analysis_result: 策略分析结果
+            
+        Returns:
+            优先级得分（越高越优先）
+        """
+        if not TREND_PRIORITY_CONFIG.get('enable', False):
+            return 0.0
+        
+        if symbol not in TREND_FOLLOW_ASSETS:
+            return 0.0
+        
+        asset_config = TREND_FOLLOW_ASSETS[symbol]
+        base_priority = asset_config.get('priority_weight', 1.0)
+        
+        # 获取该ETF的分析结果
+        etf_analysis = analysis_result.get('etf_analysis', {}).get(symbol, {})
+        strength = etf_analysis.get('strength', {})
+        trend_info = strength.get('trend', {})
+        
+        # 趋势方向加成
+        trend_direction = trend_info.get('direction', 'unknown')
+        trend_confirmed = trend_info.get('confirmed', False)
+        
+        if TREND_PRIORITY_CONFIG.get('prefer_uptrend', True):
+            if trend_direction == 'uptrend':
+                boost = TREND_PRIORITY_CONFIG.get('uptrend_confirmed_boost', 1.8) if trend_confirmed else 1.3
+                base_priority *= boost
+            elif trend_direction == 'downtrend':
+                penalty = TREND_PRIORITY_CONFIG.get('downtrend_penalty', 0.2)
+                base_priority *= penalty if trend_confirmed else 0.4
+        
+        # 避险资产加成（黄金）
+        if asset_config.get('is_safe_haven', False):
+            base_priority *= TREND_PRIORITY_CONFIG.get('safe_haven_boost', 1.6)
+        
+        # 全球趋势资产加成（纳指、印度）
+        if asset_config.get('is_global_trend', False):
+            base_priority *= TREND_PRIORITY_CONFIG.get('global_trend_boost', 1.5)
+        
+        # 市场环境加成
+        if self.market_regime == 'bear':
+            base_priority *= TREND_PRIORITY_CONFIG.get('bear_market_trend_boost', 2.0)
+        elif self.market_regime == 'bull':
+            # 【优化v5】牛市环境下趋势资产加成
+            base_priority *= TREND_PRIORITY_CONFIG.get('bull_market_trend_boost', 1.2)
+        
+        return base_priority
+    
+    def sort_buy_candidates(self, long_positions: List[dict], analysis_result: dict) -> List[dict]:
+        """
+        【新增】对买入候选进行排序，趋势资产优先
+        
+        Args:
+            long_positions: 策略推荐的多头持仓列表
+            analysis_result: 策略分析结果
+            
+        Returns:
+            排序后的持仓列表
+        """
+        if not TREND_PRIORITY_CONFIG.get('enable', False):
+            return long_positions
+        
+        # 计算每个候选的优先级得分
+        scored_positions = []
+        for pos in long_positions:
+            symbol = pos['symbol']
+            trend_priority = self.get_trend_asset_priority(symbol, analysis_result)
+            
+            # 基础得分（来自策略）
+            base_score = pos.get('score', 0)
+            
+            # 综合得分 = 基础得分 + 趋势优先级
+            total_score = base_score + trend_priority * 0.5
+            
+            scored_positions.append({
+                **pos,
+                'trend_priority': trend_priority,
+                'total_score': total_score
+            })
+        
+        # 按综合得分排序（高分优先）
+        scored_positions.sort(key=lambda x: x['total_score'], reverse=True)
+        
+        return scored_positions
+    
     def get_dynamic_max_positions(self) -> int:
         """【v2】根据市场环境动态调整最大持仓数"""
         market_filter = TREND_FILTER_PARAMS.get('market_filter', {})
@@ -186,8 +367,27 @@ class BacktestEngine:
             return self.max_positions
         
         if self.market_regime == 'bear':
-            return market_filter.get('bear_market_max_positions', 3)
+            return market_filter.get('bear_market_max_positions', 4)
+        elif self.market_regime == 'bull':
+            # 【优化v5】牛市允许更多持仓
+            return market_filter.get('bull_market_max_positions', 6)
         return self.max_positions
+    
+    def get_adaptive_stop_loss(self) -> float:
+        """【新增v5】根据市场环境动态调整止损"""
+        if self.market_regime == 'bull':
+            return RISK_PARAMS.get('bull_market_stop_loss', -12.0)
+        elif self.market_regime == 'bear':
+            return RISK_PARAMS.get('bear_market_stop_loss', -8.0)
+        return RISK_PARAMS.get('stop_loss', -10.0)
+    
+    def get_adaptive_buffer_days(self) -> int:
+        """【新增v5】根据市场环境动态调整买入缓冲期"""
+        if self.market_regime == 'bull':
+            return RISK_PARAMS.get('bull_market_buffer_days', 7)
+        elif self.market_regime == 'bear':
+            return RISK_PARAMS.get('bear_market_buffer_days', 12)
+        return RISK_PARAMS.get('buy_buffer_days', 10)
     
     def get_dynamic_trailing_stop(self, peak_profit: float) -> float:
         """【v2】根据盈利幅度获取动态止损距离"""
@@ -571,6 +771,226 @@ class BacktestEngine:
         
         return snapshot
     
+    def should_time_stop(self, pos: Position, date: str, analysis_result: dict) -> Tuple[bool, str]:
+        """
+        【优化v6】判断是否应该时间止损 - 改为趋势跟踪止盈
+        
+        当TIME_STOP_PARAMS.enable=False时，使用趋势跟踪止盈替代固定周期
+        
+        Args:
+            pos: 持仓信息
+            date: 当前日期
+            analysis_result: 策略分析结果
+            
+        Returns:
+            (是否应该卖出, 原因)
+        """
+        # 【优化v6】如果关闭固定周期，使用趋势跟踪止盈
+        if not TIME_STOP_PARAMS.get('enable', True):
+            return self.should_trend_stop(pos, date, analysis_result)
+        
+        current_date = datetime.strptime(date, '%Y-%m-%d')
+        buy_date = datetime.strptime(pos.buy_date, '%Y-%m-%d')
+        holding_days = (current_date - buy_date).days
+        max_holding_days = TIME_STOP_PARAMS.get('max_holding_weeks', 26) * 7
+        
+        # 未到期，不需要止损
+        if holding_days < max_holding_days:
+            return False, ""
+        
+        # 获取当前盈亏
+        profit_pct = pos.profit_loss_pct
+        
+        # 如果亏损超过阈值，强制卖出
+        force_sell_threshold = TIME_STOP_PARAMS.get('force_sell_loss_threshold', -5.0)
+        if profit_pct < force_sell_threshold:
+            return True, f"持仓到期且亏损{profit_pct:.1f}%，强制卖出"
+        
+        # 如果盈利超过阈值，检查是否可以延长持有
+        min_profit_to_extend = TIME_STOP_PARAMS.get('min_profit_to_extend', 15.0)
+        if profit_pct >= min_profit_to_extend:
+            # 检查趋势
+            if TIME_STOP_PARAMS.get('trend_override', True):
+                etf_analysis = analysis_result.get('etf_analysis', {}).get(pos.symbol, {})
+                strength = etf_analysis.get('strength', {})
+                trend_info = strength.get('trend', {})
+                
+                if trend_info.get('direction') == 'uptrend':
+                    # 趋势向上，延长持有
+                    extend_weeks = TIME_STOP_PARAMS.get('extend_weeks', 8)
+                    extended_days = max_holding_days + extend_weeks * 7
+                    if holding_days < extended_days:
+                        return False, ""
+                    else:
+                        return True, f"延期后到期(盈利{profit_pct:.1f}%，趋势向上)"
+            
+            # 检查动量
+            if TIME_STOP_PARAMS.get('momentum_override', True):
+                # 计算近期动量
+                self.data_fetcher.set_simulate_date(date)
+                df = self.data_fetcher.get_etf_history(pos.symbol, days=30)
+                if not df.empty and len(df) >= 20:
+                    recent_return = (df['close'].iloc[-1] / df['close'].iloc[-20] - 1) * 100
+                    momentum_threshold = TIME_STOP_PARAMS.get('momentum_threshold', 10.0) * 100
+                    
+                    if recent_return >= momentum_threshold:
+                        # 动量强劲，延长持有
+                        extend_weeks = TIME_STOP_PARAMS.get('extend_weeks', 8)
+                        extended_days = max_holding_days + extend_weeks * 7
+                        if holding_days < extended_days:
+                            return False, ""
+        
+        # 到期卖出
+        return True, f"持仓到期：已持有{holding_days}天(约{holding_days//30}个月)，收益{profit_pct:+.1f}%"
+    
+    def should_trend_stop(self, pos: Position, date: str, analysis_result: dict) -> Tuple[bool, str]:
+        """
+        【新增v6】趋势跟踪止盈 - 替代固定周期卖出
+        
+        根据趋势状态决定是否卖出：
+        - 趋势向下确认时卖出
+        - 盈利保护：高盈利时使用更短周期均线
+        
+        Args:
+            pos: 持仓信息
+            date: 当前日期
+            analysis_result: 策略分析结果
+            
+        Returns:
+            (是否应该卖出, 原因)
+        """
+        if not TREND_STOP_PARAMS.get('enable', True):
+            return False, ""
+        
+        current_date = datetime.strptime(date, '%Y-%m-%d')
+        buy_date = datetime.strptime(pos.buy_date, '%Y-%m-%d')
+        holding_weeks = (current_date - buy_date).days / 7
+        
+        # 最少持仓周数才能趋势止盈
+        min_holding = TREND_STOP_PARAMS.get('min_holding_weeks', 4)
+        if holding_weeks < min_holding:
+            return False, ""
+        
+        # 获取当前盈亏
+        profit_pct = pos.profit_loss_pct
+        
+        # 获取历史数据计算趋势
+        self.data_fetcher.set_simulate_date(date)
+        df = self.data_fetcher.get_etf_history(pos.symbol, days=100)
+        
+        if df.empty or len(df) < 30:
+            return False, ""
+        
+        # 根据盈利情况选择均线周期
+        profit_lock_threshold = TREND_STOP_PARAMS.get('profit_lock_threshold', 15.0)
+        if profit_pct >= profit_lock_threshold:
+            # 高盈利时使用更短周期均线保护利润
+            ma_period = TREND_STOP_PARAMS.get('profit_lock_ma_period', 5) * 5  # 周转日
+        else:
+            ma_period = TREND_STOP_PARAMS.get('trend_ma_period', 10) * 5  # 周转日
+        
+        if len(df) < ma_period + 5:
+            return False, ""
+        
+        # 计算均线
+        df['ma'] = df['close'].rolling(ma_period).mean()
+        
+        latest_price = df['close'].iloc[-1]
+        latest_ma = df['ma'].iloc[-1]
+        prev_ma = df['ma'].iloc[-5] if len(df) >= ma_period + 5 else latest_ma
+        
+        # 计算均线斜率
+        ma_slope = (latest_ma - prev_ma) / prev_ma * 100 if prev_ma > 0 else 0
+        
+        # 趋势破位阈值
+        trend_break_threshold = TREND_STOP_PARAMS.get('trend_break_threshold', -0.02)
+        price_below_ma = (latest_price - latest_ma) / latest_ma
+        
+        # 判断是否趋势破位
+        if TREND_STOP_PARAMS.get('sell_on_trend_break', True):
+            # 价格低于均线一定比例
+            if price_below_ma < trend_break_threshold:
+                # 确认趋势向下
+                confirm_weeks = TREND_STOP_PARAMS.get('trend_confirm_weeks', 2)
+                if holding_weeks >= min_holding + confirm_weeks:
+                    return True, f"趋势破位：价格低于{ma_period//5}周均线{abs(price_below_ma)*100:.1f}%，盈利{profit_pct:+.1f}%"
+        
+        # 检查策略分析结果中的趋势信息
+        etf_analysis = analysis_result.get('etf_analysis', {}).get(pos.symbol, {})
+        strength = etf_analysis.get('strength', {})
+        trend_info = strength.get('trend', {})
+        
+        # 趋势向下确认时卖出
+        if trend_info.get('direction') == 'downtrend' and trend_info.get('confirmed', False):
+            # 如果盈利，趋势向下确认就卖出
+            if profit_pct > 0:
+                return True, f"趋势向下确认，锁定利润{profit_pct:+.1f}%"
+            # 如果亏损，需要更严格的确认
+            elif profit_pct < -5:
+                return True, f"趋势向下确认，止损{profit_pct:.1f}%"
+        
+        return False, ""
+    
+    def check_trend_asset_buy_condition(self, symbol: str, date: str) -> Tuple[bool, str]:
+        """
+        【新增v5】检查趋势资产买入条件
+        
+        趋势资产需要确认上涨趋势才能买入
+        
+        Args:
+            symbol: ETF代码
+            date: 当前日期
+            
+        Returns:
+            (是否可以买入, 原因)
+        """
+        if symbol not in TREND_FOLLOW_ASSETS:
+            return True, ""
+        
+        asset_config = TREND_FOLLOW_ASSETS[symbol]
+        
+        # 检查是否要求上涨趋势买入
+        if not asset_config.get('require_uptrend_to_buy', False):
+            return True, ""
+        
+        # 获取数据计算趋势
+        self.data_fetcher.set_simulate_date(date)
+        df = self.data_fetcher.get_etf_history(symbol, days=100)
+        
+        if df.empty or len(df) < 30:
+            return False, "数据不足"
+        
+        # 计算均线
+        min_trend_weeks = asset_config.get('min_trend_weeks', 4)
+        ma_period = min_trend_weeks * 5  # 转换为日线
+        
+        df['ma'] = df['close'].rolling(ma_period).mean()
+        
+        if len(df) < ma_period + 5:
+            return False, "数据不足"
+        
+        latest_price = df['close'].iloc[-1]
+        latest_ma = df['ma'].iloc[-1]
+        prev_ma = df['ma'].iloc[-5]
+        
+        # 检查价格是否在均线上方
+        price_above_ma = latest_price > latest_ma
+        
+        # 检查均线斜率
+        ma_slope = (latest_ma - prev_ma) / prev_ma * 100 if prev_ma > 0 else 0
+        min_slope = asset_config.get('min_ma_slope', 0.3)
+        slope_positive = ma_slope > min_slope
+        
+        if price_above_ma and slope_positive:
+            return True, f"趋势向上(斜率{ma_slope:.2f}%)"
+        else:
+            reasons = []
+            if not price_above_ma:
+                reasons.append("价格在均线下方")
+            if not slope_positive:
+                reasons.append(f"斜率不足({ma_slope:.2f}%<{min_slope}%)")
+            return False, ", ".join(reasons)
+    
     def process_signals(self, date: str, analysis_result: dict):
         """处理策略信号"""
         from datetime import datetime
@@ -590,37 +1010,68 @@ class BacktestEngine:
         
         trades_made = []
         
-        # 最大持仓时间（6个月 ≈ 26周 ≈ 182天）
-        max_holding_days = 182
+        # 【优化v6】如果关闭固定周期，使用趋势跟踪止盈
+        use_trend_stop = not TIME_STOP_PARAMS.get('enable', True)
+        max_holding_days = TIME_STOP_PARAMS.get('max_holding_weeks', 52) * 7
         current_date = datetime.strptime(date, '%Y-%m-%d')
         
-        # 【v2】买入缓冲期天数
-        buy_buffer_days = RISK_PARAMS.get('buy_buffer_days', 5)
+        # 【优化v5】使用自适应买入缓冲期
+        buy_buffer_days = self.get_adaptive_buffer_days()
         
-        # 1. 先检查持仓时间限制（优先级最高）
-        for symbol in list(self.positions.keys()):
-            pos = self.positions[symbol]
-            buy_date = datetime.strptime(pos.buy_date, '%Y-%m-%d')
-            holding_days = (current_date - buy_date).days
-            
-            if holding_days >= max_holding_days:
+        # 【优化v6】趋势跟踪止盈检查（替代固定周期）
+        if use_trend_stop:
+            for symbol in list(self.positions.keys()):
+                pos = self.positions[symbol]
                 # 更新当前价格
                 current_price = self.get_current_price(symbol, date)
                 if current_price:
                     pos.current_price = current_price
-                    pct_change = (current_price - pos.cost_price) / pos.cost_price * 100
-                    pct_str = f"+{pct_change:.1f}%" if pct_change >= 0 else f"{pct_change:.1f}%"
-                    reason = f"持仓到期：已持有{holding_days}天(约{holding_days//30}个月)，收益{pct_str}"
-                    trade = self.execute_sell(symbol, date, reason)
-                    if trade:
-                        trades_made.append(trade)
-                        print(f"  ⏰ 到期卖出 {pos.name}({symbol}): 持有{holding_days}天，收益{pct_str}")
+                    if current_price > pos.highest_price:
+                        pos.highest_price = current_price
+                    
+                    # 使用趋势跟踪止盈
+                    should_sell, reason = self.should_trend_stop(pos, date, analysis_result)
+                    
+                    if should_sell:
+                        trade = self.execute_sell(symbol, date, reason)
+                        if trade:
+                            trades_made.append(trade)
+                            pct_str = f"+{pos.profit_loss_pct:.1f}%" if pos.profit_loss_pct >= 0 else f"{pos.profit_loss_pct:.1f}%"
+                            print(f"  📉 趋势止盈 {pos.name}({symbol}): {reason}")
+        else:
+            # 1. 原有的固定周期检查逻辑
+            for symbol in list(self.positions.keys()):
+                pos = self.positions[symbol]
+                buy_date = datetime.strptime(pos.buy_date, '%Y-%m-%d')
+                holding_days = (current_date - buy_date).days
+                
+                if holding_days >= max_holding_days:
+                    # 更新当前价格
+                    current_price = self.get_current_price(symbol, date)
+                    if current_price:
+                        pos.current_price = current_price
+                        
+                        # 【优化v5】使用新的时间止损判断
+                        should_sell, reason = self.should_time_stop(pos, date, analysis_result)
+                        
+                        if should_sell:
+                            trade = self.execute_sell(symbol, date, reason)
+                            if trade:
+                                trades_made.append(trade)
+                                pct_str = f"+{pos.profit_loss_pct:.1f}%" if pos.profit_loss_pct >= 0 else f"{pos.profit_loss_pct:.1f}%"
+                                print(f"  ⏰ 到期卖出 {pos.name}({symbol}): 持有{holding_days}天，收益{pct_str}")
+                        else:
+                            # 延期持有
+                            print(f"  📈 延期持有 {pos.name}({symbol}): 盈利{pos.profit_loss_pct:.1f}%，趋势/动量良好")
         
-        # 2. 检查止损（包含动态移动止损）
-        stop_loss_threshold = RISK_PARAMS.get('stop_loss', -5.0)
+        # 2. 检查止损（包含动态移动止损）- 【优化v5】使用自适应止损
+        stop_loss_threshold = self.get_adaptive_stop_loss()
         enable_trailing = RISK_PARAMS.get('enable_trailing_stop', False)
-        trailing_trigger = RISK_PARAMS.get('trailing_stop_trigger', 15.0)
-        trailing_min_profit = RISK_PARAMS.get('trailing_stop_min_profit', 8.0)
+        trailing_trigger = RISK_PARAMS.get('trailing_stop_trigger', 20.0)
+        trailing_min_profit = RISK_PARAMS.get('trailing_stop_min_profit', 10.0)
+        
+        # 【优化v5】牛市使用更宽松的止损，熊市使用更严格的止损
+        # 注意：这里不再需要额外调整，因为get_adaptive_stop_loss已经处理了
         
         # 【v2】分批止损配置
         partial_stop = RISK_PARAMS.get('partial_stop_loss', {})
@@ -694,6 +1145,8 @@ class BacktestEngine:
                     trade = self.execute_sell(symbol, date, reason)
                     if trade:
                         trades_made.append(trade)
+                        # 【新增】记录止损事件
+                        self.record_stop_loss(symbol, date)
                         print(f"  🛑 止损卖出 {pos.name}({symbol}): 亏损{abs(pct_change):.1f}%")
         
         # 3. 处理策略建议的卖出（回避信号）- 【v2】熊市时不主动卖出盈利持仓
@@ -719,8 +1172,11 @@ class BacktestEngine:
         add_trades = self.check_profit_add(date, analysis_result)
         trades_made.extend(add_trades)
         
-        # 5. 处理买入 - 【v2】增加板块和相关性检查
-        for pos_info in long_positions:
+        # 5. 处理买入 - 【v2】增加板块和相关性检查，【v3】增加冷却检查和趋势排序，【v5】增加趋势资产买入条件检查
+        # 【新增】对买入候选进行趋势优先排序
+        sorted_positions = self.sort_buy_candidates(long_positions, analysis_result)
+        
+        for pos_info in sorted_positions:
             symbol = pos_info['symbol']
             name = pos_info['name']
             reason = pos_info.get('reason', '策略推荐买入')
@@ -733,6 +1189,18 @@ class BacktestEngine:
             dynamic_max = self.get_dynamic_max_positions()
             if len(self.positions) >= dynamic_max:
                 break
+            
+            # 【新增v5】检查趋势资产买入条件
+            can_buy_trend, trend_reason = self.check_trend_asset_buy_condition(symbol, date)
+            if not can_buy_trend:
+                print(f"  📉 跳过 {name}({symbol}): 趋势资产买入条件不满足 - {trend_reason}")
+                continue
+            
+            # 【新增】检查止损冷却期
+            can_buy, cooldown_reason = self.check_cooldown(symbol, date)
+            if not can_buy:
+                print(f"  ❄️ 跳过 {name}({symbol}): {cooldown_reason}")
+                continue
             
             # 【v2】检查板块仓位限制
             if not self.check_sector_limit(symbol):
@@ -750,6 +1218,11 @@ class BacktestEngine:
                 # 检查是否为绝望期买入
                 if '绝望期' in reason or 'despair' in reason.lower():
                     use_partial = True
+            
+            # 【新增】显示趋势优先级信息
+            trend_priority = pos_info.get('trend_priority', 0)
+            if trend_priority > 0:
+                reason += f" [趋势优先:{trend_priority:.1f}]"
             
             trade = self.execute_buy(symbol, name, date, reason, partial=use_partial)
             if trade:
