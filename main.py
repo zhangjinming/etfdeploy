@@ -12,6 +12,8 @@ ETF配置系统
 from strategy import IntegratedETFStrategy
 from report_generator import MarkdownReportGenerator
 from simulation import simulate_and_verify, simulate_period
+from backtest import BacktestEngine, run_backtest
+from backtest_report import generate_backtest_report
 
 
 def main():
@@ -31,12 +33,59 @@ def main():
     return results
 
 
+def run_full_backtest(start_date: str, end_date: str, initial_capital: float = 10000.0):
+    """
+    运行完整回测并生成报告
+    
+    Args:
+        start_date: 开始日期 'YYYY-MM-DD'
+        end_date: 结束日期 'YYYY-MM-DD'
+        initial_capital: 初始资金
+    """
+    print("\n" + "=" * 60)
+    print("🚀 开始回测...")
+    print("=" * 60)
+    
+    # 运行回测
+    result = run_backtest(start_date, end_date, initial_capital)
+    
+    if not result:
+        print("回测失败！")
+        return None
+    
+    # 生成报告
+    report_path = generate_backtest_report(result)
+    
+    # 打印回测摘要
+    print("\n" + "=" * 60)
+    print("📊 回测完成！")
+    print("=" * 60)
+    print(f"  回测期间: {start_date} 至 {end_date}")
+    print(f"  初始资金: ¥{result['initial_capital']:,.2f}")
+    print(f"  最终资金: ¥{result['final_value']:,.2f}")
+    print(f"  总收益率: {result['total_return']:+.2f}%")
+    print(f"  年化收益率: {result['annual_return']:+.2f}%")
+    print(f"  基准收益率: {result['benchmark_return']:+.2f}%")
+    print(f"  超额收益: {result['excess_return']:+.2f}%")
+    print(f"  最大回撤: {result['max_drawdown']:.2f}%")
+    print(f"  胜率: {result['win_rate']:.1f}%")
+    print(f"  总交易次数: {result['total_trades']}")
+    print("=" * 60)
+    print(f"📄 报告已保存至: {report_path}")
+    print("=" * 60)
+    
+    return result
+
+
 if __name__ == "__main__":
     # 默认运行当前日期分析
     # main()
     
     # 模拟并验证历史数据
-    simulate_and_verify("2020-07-01", "2020-12-30")
+    # simulate_and_verify("2025-01-01", "2025-12-20")
     
     # 仅模拟（不验证）
     # simulate_period("2024-03-01", "2024-03-16")
+    
+    # 运行回测
+    run_full_backtest("2025-01-01", "2025-12-30", initial_capital=10000.0)

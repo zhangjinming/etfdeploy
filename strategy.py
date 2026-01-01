@@ -7,7 +7,9 @@ import numpy as np
 from config import (
     ETF_POOL, BENCHMARK_ETF, MARKET_REGIME_PARAMS, 
     DESPAIR_CONFIRMATION, SIGNAL_THRESHOLDS, NO_DESPAIR_BUY_ASSETS,
-    VOLATILITY_FILTER, SPECIAL_ASSETS, SPECIAL_ASSET_RULES
+    VOLATILITY_FILTER, SPECIAL_ASSETS, SPECIAL_ASSET_RULES,
+    COMMODITY_ETF_PARAMS, DESPAIR_SHORT_LIMITS, SIGNAL_STRENGTH_PARAMS,
+    TREND_FOLLOW_ASSETS, TREND_FILTER_PARAMS
 )
 from data_fetcher import ETFDataFetcher
 from analyzers import StrengthWeaknessAnalyzer, EmotionCycleAnalyzer, CapitalFlowAnalyzer, HedgeStrategy
@@ -19,6 +21,7 @@ class IntegratedETFStrategy:
     整合所有策略，生成最终配置建议
     优化：采用周线级别分析，减少日线噪音
     新增：宏观市场环境过滤器
+    新增：趋势过滤器，熊市减少抄底频率
     """
     
     def __init__(self, use_weekly: bool = True, simulate_date: Optional[str] = None):
@@ -36,6 +39,9 @@ class IntegratedETFStrategy:
         self.hedge_strategy = None
         self.market_regime = None  # 缓存市场环境
         self.market_volatility = None  # 缓存市场波动率
+        self.trend_filter_cache = {}  # 【新增】趋势过滤器缓存
+        self.despair_signal_count = 0  # 【新增】当周绝望期信号计数
+        self.despair_cooldown = {}  # 【新增】ETF抄底冷却记录
     
     def set_simulate_date(self, date: str):
         """设置模拟日期"""
@@ -43,6 +49,160 @@ class IntegratedETFStrategy:
         self.data_fetcher.set_simulate_date(date)
         self.market_regime = None  # 清除缓存
         self.market_volatility = None  # 清除缓存
+        self.trend_filter_cache = {}  # 【新增】清除趋势过滤器缓存
+        self.despair_signal_count = 0  # 【新增】重置信号计数
+    
+    def get_trend_filter(self, symbol: str, df: pd.DataFrame) -> Dict:
+        """
+        【新增】趋势过滤器 - 判断个股/ETF的中期趋势状态
+        
+        用于熊市环境下过滤抄底信号，减少逆势操作
+        
+        Args:
+            symbol: ETF代码
+            df: 日线数据
+            
+        Returns:
+            趋势过滤结果，包含：
+            - trend_state: 趋势状态 (strong_down/down/neutral/up/strong_up)
+            - allow_despair_buy: 是否允许绝望期抄底
+            - confidence_factor: 置信度调整因子
+            - reasons: 判断原因
+        """
+        # 检查缓存
+        if symbol in self.trend_filter_cache:
+            return self.trend_filter_cache[symbol]
+        
+        result = {
+            'trend_state': 'neutral',
+            'allow_despair_buy': True,
+            'confidence_factor': 1.0,
+            'reasons': [],
+            'ma_alignment': 'neutral',
+            'price_position': 'neutral',
+            'reversal_signal': False
+        }
+        
+        if df.empty or len(df) < 100:
+            self.trend_filter_cache[symbol] = result
+            return result
+        
+        # 转换为周线
+        weekly_df = self._convert_to_weekly(df) if self.use_weekly else df
+        
+        if len(weekly_df) < TREND_FILTER_PARAMS['long_ma'] + 5:
+            self.trend_filter_cache[symbol] = result
+            return result
+        
+        # 计算多周期均线
+        short_period = TREND_FILTER_PARAMS['short_ma']
+        mid_period = TREND_FILTER_PARAMS['mid_ma']
+        long_period = TREND_FILTER_PARAMS['long_ma']
+        
+        weekly_df['ma_short'] = weekly_df['close'].rolling(short_period).mean()
+        weekly_df['ma_mid'] = weekly_df['close'].rolling(mid_period).mean()
+        weekly_df['ma_long'] = weekly_df['close'].rolling(long_period).mean()
+        
+        latest = weekly_df.iloc[-1]
+        prev_week = weekly_df.iloc[-2] if len(weekly_df) >= 2 else latest
+        
+        price = latest['close']
+        ma_short = latest['ma_short']
+        ma_mid = latest['ma_mid']
+        ma_long = latest['ma_long']
+        
+        # 1. 判断均线排列
+        if ma_short < ma_mid < ma_long:
+            result['ma_alignment'] = 'bearish'  # 空头排列
+            result['reasons'].append('均线空头排列(短<中<长)')
+        elif ma_short > ma_mid > ma_long:
+            result['ma_alignment'] = 'bullish'  # 多头排列
+            result['reasons'].append('均线多头排列(短>中>长)')
+        else:
+            result['ma_alignment'] = 'mixed'
+            result['reasons'].append('均线交织')
+        
+        # 2. 判断价格相对均线位置
+        below_all = price < ma_short and price < ma_mid and price < ma_long
+        above_all = price > ma_short and price > ma_mid and price > ma_long
+        
+        if below_all:
+            result['price_position'] = 'below_all'
+            result['reasons'].append('价格在所有均线下方')
+        elif above_all:
+            result['price_position'] = 'above_all'
+            result['reasons'].append('价格在所有均线上方')
+        else:
+            result['price_position'] = 'mixed'
+        
+        # 3. 计算长期均线斜率
+        if len(weekly_df) >= long_period + 5:
+            ma_long_prev = weekly_df['ma_long'].iloc[-5]
+            ma_slope = (ma_long - ma_long_prev) / ma_long_prev * 100 if ma_long_prev > 0 else 0
+        else:
+            ma_slope = 0
+        
+        # 4. 综合判断趋势状态
+        strong_down_conditions = TREND_FILTER_PARAMS['strong_downtrend_conditions']
+        slope_threshold = strong_down_conditions['slope_threshold']
+        
+        # 强下跌趋势：空头排列 + 价格在所有均线下方 + 均线向下
+        if (result['ma_alignment'] == 'bearish' and 
+            result['price_position'] == 'below_all' and 
+            ma_slope < slope_threshold):
+            result['trend_state'] = 'strong_down'
+            result['allow_despair_buy'] = False
+            result['confidence_factor'] = 0.3
+            result['reasons'].append(f'强下跌趋势(斜率{ma_slope:.2f}%)')
+        
+        # 下跌趋势：空头排列或价格在均线下方
+        elif result['ma_alignment'] == 'bearish' or result['price_position'] == 'below_all':
+            result['trend_state'] = 'down'
+            result['confidence_factor'] = 0.5
+            result['reasons'].append('下跌趋势')
+        
+        # 上涨趋势
+        elif result['ma_alignment'] == 'bullish' and result['price_position'] == 'above_all':
+            result['trend_state'] = 'strong_up'
+            result['confidence_factor'] = 1.2
+            result['reasons'].append('强上涨趋势')
+        
+        elif result['ma_alignment'] == 'bullish' or result['price_position'] == 'above_all':
+            result['trend_state'] = 'up'
+            result['confidence_factor'] = 1.1
+            result['reasons'].append('上涨趋势')
+        
+        # 5. 检查反转信号
+        reversal_config = TREND_FILTER_PARAMS['reversal_confirmation']
+        
+        # 检查是否形成更高的低点
+        if len(weekly_df) >= 8:
+            recent_lows = weekly_df['low'].iloc[-8:]
+            min_idx = recent_lows.idxmin()
+            min_pos = recent_lows.index.get_loc(min_idx)
+            
+            # 如果最低点不在最近2周，且最近价格高于最低点
+            if min_pos < len(recent_lows) - 2:
+                bounce_pct = (price / recent_lows.min() - 1) * 100
+                if bounce_pct >= reversal_config['min_bounce_pct']:
+                    result['reversal_signal'] = True
+                    result['reasons'].append(f'反弹{bounce_pct:.1f}%，可能见底')
+                    # 有反转信号时，适当提高置信度
+                    if result['trend_state'] in ['down', 'strong_down']:
+                        result['confidence_factor'] = min(result['confidence_factor'] + 0.2, 0.7)
+        
+        # 检查短期均线是否上穿中期均线（金叉）
+        if len(weekly_df) >= 3:
+            prev_ma_short = weekly_df['ma_short'].iloc[-2]
+            prev_ma_mid = weekly_df['ma_mid'].iloc[-2]
+            
+            if prev_ma_short < prev_ma_mid and ma_short > ma_mid:
+                result['reversal_signal'] = True
+                result['reasons'].append('短期均线金叉')
+                result['confidence_factor'] = min(result['confidence_factor'] + 0.15, 0.8)
+        
+        self.trend_filter_cache[symbol] = result
+        return result
     
     def get_market_volatility(self) -> Dict:
         """
@@ -253,6 +413,7 @@ class IntegratedETFStrategy:
         7. P0新增：连续4周确认机制（从2周增加）
         8. P0新增：要求跌幅收窄确认
         9. P0新增：基准回撤限制
+        10. 【新增】趋势过滤器：熊市减少抄底频率
         
         Returns:
             验证结果
@@ -261,7 +422,8 @@ class IntegratedETFStrategy:
             'valid': True,
             'confidence': 1.0,
             'reasons': [],
-            'warnings': []
+            'warnings': [],
+            'trend_filter': None  # 【新增】趋势过滤结果
         }
         
         # === P0优化：禁止特定资产绝望期抄底 ===
@@ -290,6 +452,73 @@ class IntegratedETFStrategy:
             result['confidence'] = 0
             result['reasons'].append(f"基准回撤过大({benchmark_drawdown:.1f}%)，暂停抄底")
             return result
+        
+        # === 【新增】趋势过滤器检查 ===
+        trend_filter = self.get_trend_filter(symbol, df)
+        result['trend_filter'] = trend_filter
+        
+        bear_restrictions = TREND_FILTER_PARAMS['bear_market_restrictions']
+        
+        # 熊市环境下应用趋势过滤
+        if market['regime'] == 'bear' and bear_restrictions['enable']:
+            # 强下跌趋势：禁止抄底
+            if not trend_filter['allow_despair_buy']:
+                result['valid'] = False
+                result['confidence'] = 0
+                result['reasons'].append(f"趋势过滤：{', '.join(trend_filter['reasons'][:2])}")
+                return result
+            
+            # 下跌趋势：大幅降低置信度
+            if trend_filter['trend_state'] in ['down', 'strong_down']:
+                result['confidence'] *= trend_filter['confidence_factor']
+                result['warnings'].append(f"趋势向下，抄底风险高")
+            
+            # 熊市抄底需要更严格的RSI条件
+            rsi = emotion.get('rsi', 50)
+            min_rsi = bear_restrictions['min_rsi']
+            if rsi > min_rsi:
+                result['confidence'] *= 0.5
+                result['warnings'].append(f"熊市抄底要求RSI<{min_rsi}，当前{rsi:.1f}")
+            
+            # 检查成交量是否枯竭
+            if bear_restrictions['require_volume_dry'] and self.use_weekly and len(df) >= 30:
+                weekly_df = self._convert_to_weekly(df)
+                if len(weekly_df) >= 20:
+                    recent_vol = weekly_df['volume'].iloc[-1]
+                    vol_ma = weekly_df['volume'].iloc[-20:].mean()
+                    vol_ratio = recent_vol / vol_ma if vol_ma > 0 else 1
+                    
+                    volume_dry_ratio = bear_restrictions['volume_dry_ratio']
+                    if vol_ratio > volume_dry_ratio:
+                        result['confidence'] *= 0.6
+                        result['warnings'].append(f"成交量未枯竭({vol_ratio:.0%})，恐慌可能未结束")
+                    else:
+                        result['reasons'].append(f"成交量枯竭({vol_ratio:.0%})，恐慌盘出尽")
+            
+            # 检查是否有反转信号
+            if not trend_filter['reversal_signal']:
+                result['confidence'] *= 0.7
+                result['warnings'].append("未出现反转信号，建议等待")
+            else:
+                result['reasons'].append("出现反转信号")
+            
+            # 【新增】熊市抄底信号数量限制
+            max_signals = bear_restrictions['max_weekly_signals']
+            if self.despair_signal_count >= max_signals:
+                result['valid'] = False
+                result['confidence'] = 0
+                result['reasons'].append(f"本周抄底信号已达上限({max_signals}个)")
+                return result
+            
+            # 【新增】冷却期检查
+            cooldown_weeks = bear_restrictions['cooldown_weeks']
+            if symbol in self.despair_cooldown:
+                weeks_since = self.despair_cooldown[symbol]
+                if weeks_since < cooldown_weeks:
+                    result['valid'] = False
+                    result['confidence'] = 0
+                    result['reasons'].append(f"{symbol}抄底冷却中，还需{cooldown_weeks - weeks_since}周")
+                    return result
         
         # 高波动率降低置信度
         if volatility.get('level') == 'high':
@@ -341,10 +570,87 @@ class IntegratedETFStrategy:
                 result['confidence'] *= 1.15
                 result['reasons'].append('出现长下影线，底部支撑')
         
-        # === P0优化：连续N周确认机制（从2周增加到4周） ===
+        # 【胜率优化】检查5：价格企稳确认（不创新低）
+        if DESPAIR_CONFIRMATION.get('require_price_stabilization', True) and self.use_weekly and len(df) >= 30:
+            weekly_df = self._convert_to_weekly(df)
+            stabilization_weeks = DESPAIR_CONFIRMATION.get('stabilization_weeks', 3)  # 【胜率优化】从2周增加到3周
+            if len(weekly_df) >= stabilization_weeks + 4:
+                # 检查最近N周是否创新低
+                recent_lows = weekly_df['low'].iloc[-stabilization_weeks:]
+                prior_low = weekly_df['low'].iloc[-stabilization_weeks-4:-stabilization_weeks].min()
+                current_low = recent_lows.min()
+                
+                if current_low < prior_low * 0.98:  # 创新低（允许2%误差）
+                    result['confidence'] *= 0.5  # 【胜率优化】惩罚从0.6加重到0.5
+                    result['warnings'].append('近期创新低，底部未确认')
+                else:
+                    result['confidence'] *= 1.15  # 【胜率优化】奖励从1.1提高到1.15
+                    result['reasons'].append('价格企稳，未创新低')
+        
+        # 【胜率优化】检查6：RSI底背离确认
+        if DESPAIR_CONFIRMATION.get('require_rsi_divergence', False) and self.use_weekly and len(df) >= 60:
+            weekly_df = self._convert_to_weekly(df)
+            if len(weekly_df) >= 20:
+                # 计算RSI
+                delta = weekly_df['close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi_series = 100 - (100 / (1 + rs))
+                
+                if len(rsi_series) >= 10:
+                    # 检查价格创新低但RSI未创新低（底背离）
+                    price_recent = weekly_df['close'].iloc[-5:]
+                    price_prior = weekly_df['close'].iloc[-10:-5]
+                    rsi_recent = rsi_series.iloc[-5:]
+                    rsi_prior = rsi_series.iloc[-10:-5]
+                    
+                    price_new_low = price_recent.min() < price_prior.min()
+                    rsi_higher_low = rsi_recent.min() > rsi_prior.min()
+                    
+                    if price_new_low and rsi_higher_low:
+                        result['confidence'] *= 1.3  # 【胜率优化】从1.25提高到1.3
+                        result['reasons'].append('RSI底背离，反转信号强')
+                    elif not price_new_low and rsi_recent.iloc[-1] > 30:
+                        result['confidence'] *= 1.1
+                        result['reasons'].append('RSI回升，动能改善')
+        
+        # 【胜率优化】检查7：反弹确认（新增）
+        if DESPAIR_CONFIRMATION.get('require_bounce_confirm', True) and self.use_weekly and len(df) >= 30:
+            weekly_df = self._convert_to_weekly(df)
+            if len(weekly_df) >= 10:
+                # 计算从近期最低点的反弹幅度
+                recent_low = weekly_df['low'].iloc[-10:].min()
+                current_price = weekly_df['close'].iloc[-1]
+                bounce_pct = (current_price / recent_low - 1) * 100
+                
+                min_bounce = DESPAIR_CONFIRMATION.get('min_bounce_from_low', 3.0)
+                if bounce_pct >= min_bounce:
+                    result['confidence'] *= 1.2
+                    result['reasons'].append(f'从低点反弹{bounce_pct:.1f}%，企稳信号')
+                elif bounce_pct < 0:
+                    result['confidence'] *= 0.5
+                    result['warnings'].append('仍在创新低，不宜抄底')
+        
+        # 【胜率优化】检查8：更高低点确认（新增）
+        if DESPAIR_CONFIRMATION.get('require_higher_low', True) and self.use_weekly and len(df) >= 40:
+            weekly_df = self._convert_to_weekly(df)
+            if len(weekly_df) >= 12:
+                # 检查是否形成更高的低点
+                recent_low = weekly_df['low'].iloc[-4:].min()
+                prior_low = weekly_df['low'].iloc[-8:-4].min()
+                
+                if recent_low > prior_low * 1.01:  # 最近低点高于之前低点1%以上
+                    result['confidence'] *= 1.2
+                    result['reasons'].append('形成更高低点，底部确认')
+                elif recent_low < prior_low * 0.98:  # 创新低
+                    result['confidence'] *= 0.6
+                    result['warnings'].append('未形成更高低点')
+        
+        # === P0优化：连续N周确认机制（从4周增加到5周） ===
         if self.use_weekly and len(df) >= 30:
             weekly_df = self._convert_to_weekly(df)
-            confirm_weeks = DESPAIR_CONFIRMATION.get('consecutive_weeks_confirm', 4)  # P0：改为4周
+            confirm_weeks = DESPAIR_CONFIRMATION.get('consecutive_weeks_confirm', 5)  # 【胜率优化】改为5周
             if len(weekly_df) >= confirm_weeks + 1:
                 # P0新增：检查跌幅收窄确认
                 if DESPAIR_CONFIRMATION.get('require_decline_slowdown', True):
@@ -352,12 +658,12 @@ class IntegratedETFStrategy:
                     prev_change = (weekly_df['close'].iloc[-2] / weekly_df['close'].iloc[-3] - 1) * 100
                     
                     # 跌幅收窄条件：最近一周跌幅 < 前一周跌幅 * 收窄比例
-                    slowdown_ratio = DESPAIR_CONFIRMATION.get('decline_slowdown_ratio', 0.5)
+                    slowdown_ratio = DESPAIR_CONFIRMATION.get('decline_slowdown_ratio', 0.4)  # 【胜率优化】从0.5降到0.4
                     
                     if prev_change < 0:  # 前一周是下跌的
                         if latest_change >= 0:
                             # 已经止跌转涨，好信号
-                            result['confidence'] *= 1.2
+                            result['confidence'] *= 1.25  # 【胜率优化】从1.2提高到1.25
                             result['reasons'].append('止跌转涨，企稳信号明确')
                         elif latest_change > prev_change * slowdown_ratio:
                             # 跌幅收窄
@@ -365,11 +671,12 @@ class IntegratedETFStrategy:
                             result['reasons'].append(f'跌幅收窄({prev_change:.1f}%→{latest_change:.1f}%)')
                         else:
                             # 跌幅未收窄，继续下跌
-                            result['confidence'] *= 0.5
+                            result['confidence'] *= 0.4  # 【胜率优化】从0.5加重到0.4
                             result['warnings'].append(f'跌幅未收窄({prev_change:.1f}%→{latest_change:.1f}%)，建议等待')
                     else:
                         # 前一周已经是上涨，检查是否持续企稳
                         if latest_change >= 0:
+                            result['confidence'] *= 1.1
                             result['reasons'].append('连续企稳，可考虑建仓')
                 
                 # 检查最近N周是否持续在低位震荡（未继续大幅下跌）
@@ -379,13 +686,18 @@ class IntegratedETFStrategy:
                 ]
                 # 如果最近几周有单周跌幅超过5%，说明还在恐慌中
                 if any(c < -5 for c in recent_changes[:2]):  # 最近2周
-                    result['confidence'] *= 0.6
+                    result['confidence'] *= 0.5  # 【胜率优化】从0.6加重到0.5
                     result['warnings'].append('近期仍有大幅下跌，恐慌未结束')
         
-        # 最终判断
-        if result['confidence'] < 0.5:
+        # 最终判断（【胜率优化】提高置信度门槛）
+        if result['confidence'] < 0.6:  # 【胜率优化】从0.5提高到0.6
             result['valid'] = False
             result['reasons'].append('综合置信度过低')
+        
+        # 【新增】如果验证通过，更新信号计数
+        if result['valid'] and market['regime'] == 'bear':
+            self.despair_signal_count += 1
+            self.despair_cooldown[symbol] = 0  # 重置冷却
         
         return result
     
@@ -401,6 +713,10 @@ class IntegratedETFStrategy:
         # 0. 首先获取市场环境和波动率
         market_regime = self.get_market_regime()
         market_volatility = self.get_market_volatility()
+        
+        # 【新增】重置趋势过滤器状态
+        self.trend_filter_cache = {}
+        self.despair_signal_count = 0
         
         results = {
             'timestamp': self.simulate_date if self.simulate_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -424,6 +740,7 @@ class IntegratedETFStrategy:
             print(f"  均线位置: {market_regime['ma_position']:.2%} | 均线斜率: {market_regime['ma_slope']:.2f}%")
             if market_regime['regime'] == 'bear':
                 print(f"  ⚠️ 熊市环境下，绝望期信号需要更多确认，避免抄底陷阱")
+                print(f"  📉 趋势过滤器已启用：每周最多{TREND_FILTER_PARAMS['bear_market_restrictions']['max_weekly_signals']}个抄底信号")
         
         # 显示波动率
         print(f"\n  {vol_emoji.get(market_volatility['level'], '❓')} 波动率: {market_volatility.get('description', '未知')}")
@@ -459,6 +776,8 @@ class IntegratedETFStrategy:
                     emotion_result['adjustment_reason'] = despair_validation['reasons']
             
             # 计算综合得分（复用HedgeStrategy的逻辑，加入市场环境因子）
+            # 将symbol添加到strength_result中，用于识别特殊资产
+            strength_result['symbol'] = symbol
             composite_score = self._calculate_composite_score(
                 strength_result, emotion_result, 
                 market_regime=market_regime,
@@ -491,6 +810,17 @@ class IntegratedETFStrategy:
                 phase_display += " ⚠️(需确认)"
             print(f"    情绪阶段: {phase_display} (强度:{emotion_result.get('phase_strength', 0):.0%})")
             print(f"    RSI: {strength_result.get('rsi', 0):.1f} | 情绪指数: {emotion_result.get('emotion_index', 0):.2f}")
+            
+            # 【新增】显示趋势过滤信息（仅在熊市且有绝望期验证时）
+            if despair_validation and despair_validation.get('trend_filter'):
+                tf = despair_validation['trend_filter']
+                trend_state_cn = {
+                    'strong_down': '📉强下跌', 'down': '📉下跌', 
+                    'neutral': '➖震荡', 'up': '📈上涨', 'strong_up': '📈强上涨'
+                }
+                print(f"    趋势状态: {trend_state_cn.get(tf['trend_state'], '未知')} | 置信因子: {tf['confidence_factor']:.1f}")
+                if tf['reversal_signal']:
+                    print(f"    🔄 检测到反转信号")
             
             if despair_validation and despair_validation['warnings']:
                 print(f"    ⚠️ 警告: {', '.join(despair_validation['warnings'][:2])}")
@@ -635,15 +965,98 @@ class IntegratedETFStrategy:
         - 情绪指数（权重15%）
         - 市场环境调整（权重15%）
         
-        新增：
+        优化：
         - 市场环境过滤
         - 绝望期验证结果
+        - 【优化】趋势性资产使用TREND_FOLLOW_ASSETS配置
+        - 【优化】绝望期只做多不做空
+        - 信号强度分级
         """
         # 强弱得分（-5到5映射到-1到1）
         strength_score = strength['score'] / 5
         
-        # 情绪阶段得分
+        # 获取趋势信息
+        trend_info = strength.get('trend', {})
+        trend_direction = trend_info.get('direction', 'unknown')
+        trend_confirmed = trend_info.get('confirmed', False)
+        
+        # 获取symbol
+        symbol = strength.get('symbol', '')
+        
+        # 获取情绪阶段
         phase = emotion['phase']
+        is_despair = phase == 'despair'
+        
+        # === 【优化】趋势性资产使用专属配置 ===
+        if symbol in TREND_FOLLOW_ASSETS:
+            trend_config = TREND_FOLLOW_ASSETS[symbol]
+            trend_weight = trend_config.get('trend_weight', 0.7)
+            emotion_weight = trend_config.get('emotion_weight', 0.3)
+            no_despair_short = trend_config.get('no_despair_short', True)
+            
+            trend_bonus = 0
+            if trend_direction == 'uptrend':
+                trend_bonus = 0.6 if trend_confirmed else 0.3
+            elif trend_direction == 'downtrend':
+                # 【优化】绝望期不给负分（不做空）
+                if is_despair and no_despair_short:
+                    trend_bonus = 0  # 绝望期下跌趋势不做空，给0分（观望）
+                else:
+                    trend_bonus = -0.6 if trend_confirmed else -0.3
+            
+            # 简化得分：强弱信号 + 趋势
+            composite = strength_score * emotion_weight + trend_bonus * trend_weight
+            
+            # 【优化】绝望期限制负分（只做多不做空）
+            if is_despair and no_despair_short and composite < 0:
+                composite = 0  # 绝望期不产生负分
+            
+            # 市场环境调整
+            if market_regime:
+                regime = market_regime.get('regime', 'unknown')
+                if regime == 'bear' and composite > 0:
+                    composite *= 0.7
+                elif regime == 'bull' and composite < 0:
+                    composite *= 0.8
+            
+            return composite
+        
+        # === 商品类ETF特殊处理（非TREND_FOLLOW_ASSETS中的商品） ===
+        commodity_symbols = COMMODITY_ETF_PARAMS.get('symbols', [])
+        if symbol in commodity_symbols or symbol in NO_DESPAIR_BUY_ASSETS:
+            # 商品类资产：纯趋势跟踪，不使用情绪周期
+            trend_weight = COMMODITY_ETF_PARAMS.get('trend_weight', 0.7)
+            emotion_weight = COMMODITY_ETF_PARAMS.get('emotion_weight', 0.3)
+            
+            trend_bonus = 0
+            if trend_direction == 'uptrend':
+                trend_bonus = 0.6 if trend_confirmed else 0.3
+            elif trend_direction == 'downtrend':
+                # 【优化】绝望期不做空
+                if is_despair and DESPAIR_SHORT_LIMITS.get('convert_avoid_to_neutral', True):
+                    trend_bonus = 0
+                else:
+                    trend_bonus = -0.6 if trend_confirmed else -0.3
+            
+            # 简化得分：强弱信号 + 趋势（商品更依赖趋势）
+            composite = strength_score * (1 - trend_weight) + trend_bonus * trend_weight
+            
+            # 【优化】绝望期限制负分
+            if is_despair and composite < 0:
+                composite = 0
+            
+            # 市场环境调整
+            if market_regime:
+                regime = market_regime.get('regime', 'unknown')
+                if regime == 'bear' and composite > 0:
+                    composite *= 0.7
+                elif regime == 'bull' and composite < 0:
+                    composite *= 0.8
+            
+            return composite
+        
+        # === 普通资产处理 ===
+        # 情绪阶段得分
         phase_strength = emotion.get('phase_strength', 0.5)
         
         phase_scores = {
@@ -653,6 +1066,15 @@ class IntegratedETFStrategy:
             'unknown': 0.0
         }
         emotion_phase_score = phase_scores.get(phase, 0)
+        
+        # === 【优化】绝望期只做多不做空 ===
+        if is_despair and DESPAIR_SHORT_LIMITS.get('convert_avoid_to_neutral', True):
+            # 绝望期不应该产生负的情绪阶段得分
+            if emotion_phase_score < 0:
+                emotion_phase_score = 0
+            # 强弱信号如果是负的，也限制为0（不做空）
+            if strength_score < 0:
+                strength_score = 0
         
         # 如果绝望期验证失败，大幅降低情绪阶段得分
         if despair_validation and not despair_validation['valid']:
@@ -706,14 +1128,29 @@ class IntegratedETFStrategy:
                 if phase_strength > 0.7:
                     despair_bonus += 0.15
         
-        # 综合评分
+        # === 信号强度分级 ===
+        signal_score = abs(strength['score'])
+        strong_threshold = SIGNAL_STRENGTH_PARAMS.get('strong_signal_score', 4)
+        if signal_score >= strong_threshold:
+            # 强信号：增加权重
+            strength_weight = SIGNAL_STRENGTH_PARAMS.get('strong_signal_weight', 1.5)
+        else:
+            # 弱信号：降低权重
+            strength_weight = SIGNAL_STRENGTH_PARAMS.get('weak_signal_weight', 0.8)
+        
+        # 综合评分（应用信号强度权重）
         composite = (
-            strength_score * 0.40 +
+            strength_score * 0.40 * strength_weight +
             emotion_phase_score * 0.30 +
             emotion_index_score * 0.15 +
             regime_adjustment * 0.15 +
             despair_bonus * 0.10 / 0.10  # 归一化后的加成
         )
+        
+        # 【优化】绝望期限制负分（只做多不做空）
+        if is_despair and DESPAIR_SHORT_LIMITS.get('convert_avoid_to_neutral', True):
+            if composite < 0:
+                composite = 0
         
         # 确保深度绝望期的ETF能获得足够高的分数（但需要验证通过）
         if phase == 'despair' and despair_bonus > 0.3:

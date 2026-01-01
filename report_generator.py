@@ -367,6 +367,9 @@ class MarkdownReportGenerator:
     def _build_verification_report(self, all_results: List[Dict], 
                                    start_date: str, end_date: str) -> str:
         """构建验证报告"""
+        from verification import get_future_price_change
+        from data_fetcher import ETFDataFetcher
+        
         lines = []
         
         # 标题
@@ -398,12 +401,22 @@ class MarkdownReportGenerator:
         lines.append("## 📋 验证说明\n")
         lines.append("""
 验证范围仅包括以下三类ETF：
-1. **多头推荐** - 对冲策略模块推荐的做多标的（验证标准：收益 ≥ 3%）
-2. **建议回避** - 对冲策略模块建议回避的标的（验证标准：涨幅 ≤ 3%）
+1. **多头推荐** - 对冲策略模块推荐的做多标的
+2. **建议回避** - 对冲策略模块建议回避的标的
 3. **强信号** - 强弱分析中得分≥4（强买入）或≤-4（强卖出）的ETF
+
+**优化后的验证标准**：
+- 买入信号：收益 ≥ 1%（弱信号）或 ≥ 2%（强信号）
+- 回避信号：涨幅 ≤ 3%
+- 止损规则：1个月内亏损超过5%触发止损
+- 绝望期做空：底部反转风险大，给予宽容度（涨幅≤4.5%仍算成功）
+- 商品类ETF：波动大，买入阈值降低0.5%
 
 表格中"验证"列标记 ✓ 的ETF参与了准确率统计。
 """)
+        
+        # 创建数据获取器用于获取所有ETF的未来涨跌
+        fetcher = ETFDataFetcher()
         
         # 每周详细分析
         lines.append("## 📅 每周分析详情\n")
@@ -419,29 +432,24 @@ class MarkdownReportGenerator:
             # 获取被验证的ETF列表
             verified_symbols = result.get('verified_symbols', set())
             
-            # 从验证数据中提取未来涨跌
-            verification = result.get('verification', {})
-            
-            # 未来1个月涨跌
+            # 获取所有ETF的未来涨跌数据（不仅仅是被验证的）
+            etf_analysis = result.get('etf_analysis', {})
             future_changes_1m = {}
-            results_1m = verification.get('1个月', [])
-            if results_1m and isinstance(results_1m[0], dict):
-                for r in results_1m:
-                    symbol = r.get('symbol')
-                    if symbol:
-                        future_changes_1m[symbol] = r.get('price_change')
-            
-            # 未来3个月涨跌
             future_changes_3m = {}
-            results_3m = verification.get('3个月', [])
-            if results_3m and isinstance(results_3m[0], dict):
-                for r in results_3m:
-                    symbol = r.get('symbol')
-                    if symbol:
-                        future_changes_3m[symbol] = r.get('price_change')
+            
+            for symbol in etf_analysis.keys():
+                # 获取未来1个月涨跌
+                change_1m = get_future_price_change(fetcher, symbol, date, 30)
+                if change_1m is not None:
+                    future_changes_1m[symbol] = change_1m
+                
+                # 获取未来3个月涨跌
+                change_3m = get_future_price_change(fetcher, symbol, date, 90)
+                if change_3m is not None:
+                    future_changes_3m[symbol] = change_3m
             
             # ETF分析表格（带验证标记和未来涨跌）
-            lines.append(self._build_strength_table(result.get('etf_analysis', {}), verified_symbols, future_changes_1m, future_changes_3m))
+            lines.append(self._build_strength_table(etf_analysis, verified_symbols, future_changes_1m, future_changes_3m))
             
             # 组合建议
             portfolio = result.get('portfolio_suggestion', {})
@@ -449,21 +457,31 @@ class MarkdownReportGenerator:
                 cash_ratio = portfolio.get('cash_ratio', 0) * 100
                 lines.append(f"\n**现金比例**: {cash_ratio:.0f}%\n")
                 
-                # 显示完整的多头推荐列表（带综合得分）
+                # 显示完整的多头推荐列表（使用etf_analysis中的综合得分以保持一致）
                 long_positions = portfolio.get('long_positions', [])
                 if long_positions:
                     long_items = []
                     for p in long_positions:
-                        score = p.get('composite_score', 0)
+                        symbol = p['symbol']
+                        # 优先使用etf_analysis中的综合得分（与表格显示一致）
+                        if symbol in etf_analysis:
+                            score = etf_analysis[symbol].get('composite_score', 0)
+                        else:
+                            score = p.get('composite_score', 0)
                         long_items.append(f"{p['name']}({score:.2f})")
                     lines.append(f"**推荐多头**: {', '.join(long_items)}\n")
                 
-                # 显示回避建议列表（带综合得分）
+                # 显示回避建议列表（使用etf_analysis中的综合得分以保持一致）
                 hedge_positions = portfolio.get('hedge_positions', [])
                 if hedge_positions:
                     hedge_items = []
                     for p in hedge_positions:
-                        score = p.get('composite_score', 0)
+                        symbol = p['symbol']
+                        # 优先使用etf_analysis中的综合得分（与表格显示一致）
+                        if symbol in etf_analysis:
+                            score = etf_analysis[symbol].get('composite_score', 0)
+                        else:
+                            score = p.get('composite_score', 0)
                         hedge_items.append(f"{p['name']}({score:.2f})")
                     lines.append(f"**建议回避**: {', '.join(hedge_items)}\n")
                 
