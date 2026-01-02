@@ -160,48 +160,48 @@ SPECIAL_ASSET_RULES = {
     },
 }
 
-# 波动率过滤参数（用于识别系统性风险）- 【优化v4】
+# 波动率过滤参数（用于识别系统性风险）- 【优化v8】
 VOLATILITY_FILTER = {
-    'extreme_vol_threshold': 4.0,   # 【优化v4】周波动率>4.0%视为极端波动（从4.5%降低）
-    'high_vol_threshold': 2.0,      # 【优化v4】周波动率>2.0%视为高波动（从2.5%降低）
+    'extreme_vol_threshold': 5.0,   # 【优化v8】周波动率>5.0%视为极端波动（从4.0%提高，更宽容）
+    'high_vol_threshold': 3.0,      # 【优化v8】周波动率>3.0%视为高波动（从2.0%提高）
     'vol_lookback_weeks': 4,        # 波动率计算回溯周数
-    'stop_despair_buy_vol': 3.0,    # 【优化v4】波动率超过此值停止绝望期抄底（从3.5%降低）
-    'max_consecutive_drops': 2,     # 【优化v4】连续下跌超过2周视为系统性风险（从3周减少）
-    'benchmark_drawdown_limit': -6, # 【优化v4】基准回撤超过-6%停止抄底（从-8%收紧）
+    'stop_despair_buy_vol': 4.0,    # 【优化v8】波动率超过此值停止绝望期抄底（从3.0%提高）
+    'max_consecutive_drops': 3,     # 【优化v8】连续下跌超过3周视为系统性风险（从2周增加）
+    'benchmark_drawdown_limit': -10,# 【优化v8】基准回撤超过-10%停止抄底（从-6%放宽）
 }
 
-# 止损止盈参数 - 【优化v5】市场环境自适应止损
+# 止损止盈参数 - 【优化v8】放宽止损，减少频繁止损导致的胜率下降
 RISK_PARAMS = {
-    'stop_loss': -10.0,         # 【优化v5】默认止损从-8%放宽到-10%，减少频繁止损
-    'take_profit': 20.0,        # 【优化v5】止盈线从18%提高到20%
-    'time_stop_weeks': 26,      # 时间止损（约6个月）
-    'time_stop_min_profit': 5.0, # 时间止损最低收益5%
+    'stop_loss': -12.0,         # 【优化v8】默认止损从-10%放宽到-12%，大幅减少频繁止损
+    'take_profit': 25.0,        # 【优化v8】止盈线从20%提高到25%
+    'time_stop_weeks': 39,      # 【优化v8】时间止损从26周延长到39周（约9个月）
+    'time_stop_min_profit': 3.0,# 【优化v8】时间止损最低收益从5%降到3%
     
     # 动态移动止损参数（优化）
     'enable_trailing_stop': True,     # 启用移动止损
-    'trailing_stop_trigger': 20.0,    # 【优化v5】盈利20%后启用移动止损（从18%提高）
-    'trailing_stop_distance': 12.0,   # 移动止损距离12%
-    'trailing_stop_min_profit': 10.0, # 【优化v5】止损后至少保留10%利润（从8%提高）
+    'trailing_stop_trigger': 25.0,    # 【优化v8】盈利25%后启用移动止损（从20%提高）
+    'trailing_stop_distance': 15.0,   # 【优化v8】移动止损距离从12%放宽到15%
+    'trailing_stop_min_profit': 12.0, # 【优化v8】止损后至少保留12%利润（从10%提高）
     
-    # 动态止损分级（放宽回撤容忍度）- 【优化v5】
+    # 动态止损分级（放宽回撤容忍度）- 【优化v8】
     'dynamic_trailing_stop': {
         'enable': True,
         'levels': [
-            {'profit_min': 20.0, 'profit_max': 35.0, 'drawdown_tolerance': 12.0},  # 【优化v5】
-            {'profit_min': 35.0, 'profit_max': 50.0, 'drawdown_tolerance': 15.0},  # 【优化v5】
-            {'profit_min': 50.0, 'profit_max': 75.0, 'drawdown_tolerance': 18.0},  # 【优化v5】
-            {'profit_min': 75.0, 'profit_max': 999.0, 'drawdown_tolerance': 22.0}, # 【优化v5】
+            {'profit_min': 20.0, 'profit_max': 35.0, 'drawdown_tolerance': 15.0},  # 【优化v8】从12%放宽到15%
+            {'profit_min': 35.0, 'profit_max': 50.0, 'drawdown_tolerance': 18.0},  # 【优化v8】从15%放宽到18%
+            {'profit_min': 50.0, 'profit_max': 75.0, 'drawdown_tolerance': 22.0},  # 【优化v8】从18%放宽到22%
+            {'profit_min': 75.0, 'profit_max': 999.0, 'drawdown_tolerance': 28.0}, # 【优化v8】从22%放宽到28%
         ],
     },
     
-    # 买入缓冲期（增加缓冲）- 【优化v5】
-    'buy_buffer_days': 10,            # 【优化v5】买入后10个交易日不止损（从7天增加）
+    # 买入缓冲期（增加缓冲）- 【优化v8】
+    'buy_buffer_days': 14,            # 【优化v8】买入后14个交易日不止损（从10天增加）
     
-    # 【优化v5】市场环境自适应止损
-    'bear_market_stop_loss': -8.0,    # 【优化v5】熊市止损线收紧到-8%（保守）
-    'bear_market_buffer_days': 12,    # 【优化v5】熊市买入缓冲期12天
-    'bull_market_stop_loss': -12.0,   # 【优化v5】牛市止损线放宽到-12%（更宽容）
-    'bull_market_buffer_days': 7,     # 【优化v5】牛市买入缓冲期7天（可更快反应）
+    # 【优化v8】市场环境自适应止损 - 放宽牛市止损
+    'bear_market_stop_loss': -10.0,   # 【优化v8】熊市止损线从-8%放宽到-10%
+    'bear_market_buffer_days': 14,    # 【优化v8】熊市买入缓冲期从12天增加到14天
+    'bull_market_stop_loss': -15.0,   # 【优化v8】牛市止损线从-12%放宽到-15%（大幅放宽）
+    'bull_market_buffer_days': 5,     # 【优化v8】牛市买入缓冲期从7天减少到5天（更快反应）
     
     # 【关闭】分批止损 - 实测会降低胜率
     'partial_stop_loss': {
@@ -213,28 +213,33 @@ RISK_PARAMS = {
     },
 }
 
-# 【优化v6】牛市适应性参数 - 进一步增强牛市环境下的策略表现
+# 【优化v8】牛市适应性参数 - 解决牛市跑输基准问题
 BULL_MARKET_PARAMS = {
     'enable': True,                       # 启用牛市适应性策略
     'enable_momentum_follow': True,       # 牛市启用动量跟踪
-    'momentum_threshold': 0.08,           # 【优化v6】动量阈值从12%降到8%（更容易触发）
-    'reduce_despair_weight': 0.7,         # 【优化v6】绝望期权重从60%提高到70%（牛市回调也是机会）
-    'increase_trend_weight': 1.5,         # 【优化v6】趋势权重从140%提高到150%
-    'rsi_oversold_threshold': 45,         # 【优化v6】牛市RSI<45即可视为超卖（从40提高）
-    'min_bounce_threshold': 3.0,          # 【优化v6】牛市反弹确认阈值从5%降到3%
-    'confidence_boost': 1.4,              # 【优化v6】牛市信号置信度加成从1.3提高到1.4
-    'max_positions_boost': 1,             # 【新增v6】牛市可额外增加1个持仓
-    'cash_ratio_reduction': 0.10,         # 【新增v6】牛市现金比例额外降低10%
+    'momentum_threshold': 0.05,           # 【优化v8】动量阈值从8%降到5%（更容易触发买入）
+    'reduce_despair_weight': 0.5,         # 【优化v8】绝望期权重从70%降到50%（牛市更依赖趋势）
+    'increase_trend_weight': 1.8,         # 【优化v8】趋势权重从150%提高到180%
+    'rsi_oversold_threshold': 50,         # 【优化v8】牛市RSI<50即可视为超卖（从45提高）
+    'min_bounce_threshold': 2.0,          # 【优化v8】牛市反弹确认阈值从3%降到2%
+    'confidence_boost': 1.6,              # 【优化v8】牛市信号置信度加成从1.4提高到1.6
+    'max_positions_boost': 2,             # 【优化v8】牛市可额外增加2个持仓（从1增加）
+    'cash_ratio_reduction': 0.15,         # 【优化v8】牛市现金比例额外降低15%（从10%增加）
+    # 【新增v8】牛市趋势跟踪买入
+    'enable_trend_follow_buy': True,      # 牛市启用趋势跟踪买入（不等绝望期）
+    'trend_follow_rsi_threshold': 55,     # 趋势跟踪买入RSI阈值
+    'trend_follow_min_weeks': 2,          # 趋势确认最少周数
+    'prefer_large_cap_in_bull': True,     # 牛市优先配置大盘股
 }
 
-# 【新增v4】止损冷却机制参数 - 避免同一标的反复止损
+# 【新增v8】止损冷却机制参数 - 减少冷却期，提高资金利用率
 STOP_LOSS_COOLDOWN = {
     'enable': True,                   # 启用冷却机制
-    'same_etf_cooldown_weeks': 12,    # 【优化v4】同一ETF止损后12周内不再买入（从8周增加）
-    'sector_cooldown_weeks': 6,       # 【优化v4】同板块止损后6周内限制买入（从4周增加）
-    'max_sector_stop_loss': 2,        # 同板块连续止损次数超过此值触发板块冷却
-    'cooldown_decay': True,           # 冷却期递减（首次12周，第二次18周...）
-    'decay_factor': 1.5,              # 递减因子
+    'same_etf_cooldown_weeks': 6,     # 【优化v8】同一ETF止损后6周内不再买入（从12周减少）
+    'sector_cooldown_weeks': 3,       # 【优化v8】同板块止损后3周内限制买入（从6周减少）
+    'max_sector_stop_loss': 3,        # 【优化v8】同板块连续止损次数从2提高到3
+    'cooldown_decay': True,           # 冷却期递减
+    'decay_factor': 1.3,              # 【优化v8】递减因子从1.5降到1.3
 }
 
 # 浮盈加仓策略参数（还原到原版本）
@@ -368,12 +373,12 @@ DESPAIR_SHORT_LIMITS = {
     'rsi_floor': 20,                  # RSI地板值，低于此值不做空
 }
 
-# 信号阈值参数（优化v5后降低阈值，牛市适应）
+# 信号阈值参数（优化v8后进一步降低阈值，解决牛市信号稀少问题）
 SIGNAL_THRESHOLDS = {
-    'strong_buy': 5,            # 【优化v5】强买入阈值从6降到5（牛市适应）
-    'buy': 4,                   # 【优化v5】买入阈值从5降到4
-    'sell': -5,                 # 卖出阈值-5
-    'strong_sell': -6,          # 强卖出阈值-6
+    'strong_buy': 4,            # 【优化v8】强买入阈值从5降到4
+    'buy': 3,                   # 【优化v8】买入阈值从4降到3（大幅降低）
+    'sell': -4,                 # 【优化v8】卖出阈值从-5提高到-4
+    'strong_sell': -5,          # 【优化v8】强卖出阈值从-6提高到-5
 }
 
 # 信号有效期（周数）
@@ -385,12 +390,12 @@ SIGNAL_VALIDITY = {
     'neutral': 1,               # 中性信号1周有效
 }
 
-# 市场环境参数 - 【优化v6】加快响应速度
+# 市场环境参数 - 【优化v8】进一步加快响应速度
 MARKET_REGIME_PARAMS = {
-    'ma_period': 10,            # 【优化v6】判断趋势的均线周期从20周缩短到10周（加快响应）
-    'slope_threshold': 0.3,     # 【优化v6】均线斜率阈值从0.5%降到0.3%（更敏感）
-    'bull_threshold': 0.015,    # 【优化v6】牛市判定从0.02降到0.015（更容易判定为牛市）
-    'bear_threshold': -0.025,   # 【优化v6】熊市判定从-0.02调整到-0.025（更难判定为熊市）
+    'ma_period': 8,             # 【优化v8】判断趋势的均线周期从10周缩短到8周（更快响应）
+    'slope_threshold': 0.2,     # 【优化v8】均线斜率阈值从0.3%降到0.2%（更敏感）
+    'bull_threshold': 0.01,     # 【优化v8】牛市判定从0.015降到0.01（更容易判定为牛市）
+    'bear_threshold': -0.03,    # 【优化v8】熊市判定从-0.025调整到-0.03（更难判定为熊市）
 }
 
 # 【优化v6】持仓到期机制 - 改为趋势跟踪止盈，取消固定周期
@@ -405,17 +410,27 @@ TIME_STOP_PARAMS = {
     'force_sell_loss_threshold': -8.0, # 【优化v6】亏损阈值从-5%放宽到-8%
 }
 
-# 【新增v6】趋势跟踪止盈参数 - 替代固定周期卖出
+# 【新增v8】趋势跟踪止盈参数 - 放宽趋势破位阈值
 TREND_STOP_PARAMS = {
     'enable': True,                   # 启用趋势跟踪止盈
     'trend_ma_period': 10,            # 趋势判断均线周期（周线）
     'trend_confirm_weeks': 2,         # 趋势确认周数
     'sell_on_trend_break': True,      # 趋势破位时卖出
-    'trend_break_threshold': -0.02,   # 趋势破位阈值（价格低于均线2%）
+    'trend_break_threshold': -0.04,   # 【优化v8】趋势破位阈值从-2%放宽到-4%（减少误杀）
     'require_volume_confirm': False,  # 不强制要求成交量确认
-    'min_holding_weeks': 4,           # 最少持仓4周才能趋势止盈
-    'profit_lock_threshold': 15.0,    # 盈利>15%时启用趋势保护
+    'min_holding_weeks': 3,           # 【优化v8】最少持仓从4周减少到3周
+    'profit_lock_threshold': 20.0,    # 【优化v8】盈利>20%时启用趋势保护（从15%提高）
     'profit_lock_ma_period': 5,       # 盈利保护使用5周均线
+}
+
+# 【新增v8】利润锁定策略参数 - 持仓达到一定时间和利率后，回调时锁定利润
+PROFIT_LOCK_PARAMS = {
+    'enable': True,                   # 启用利润锁定策略
+    'min_holding_months': 3,          # 最少持仓月数（约12周）
+    'max_holding_months': 9,          # 最大持仓月数（约39周）
+    'min_profit_pct': 16.0,           # 最低盈利比例触发条件（16%）
+    'drawdown_trigger': -6.0,         # 从最高点回撤触发卖出（-6%）
+    'lock_profit_ratio': 0.7,         # 锁定利润比例（至少保留70%的峰值利润）
 }
 
 # 趋势过滤器参数 - 用于熊市减少抄底频率 - 【优化v5】牛市适应
@@ -460,53 +475,53 @@ TREND_FILTER_PARAMS = {
         'trend_follow_min_strength': 0.5,
     },
     
-    # 大盘环境过滤 - 【优化v6】牛市提高仓位上限
+    # 大盘环境过滤 - 【优化v8】牛市大幅提高仓位上限
     'market_filter': {
         'enable': True,                       # 启用大盘过滤
         'bear_market_max_positions': 4,       # 熊市最多持仓4只
-        'bear_market_cash_ratio': 0.35,       # 【优化v6】熊市保持35%现金（从40%降低）
-        'bull_market_max_positions': 6,       # 【优化v6】牛市最多持仓6只
-        'bull_market_cash_ratio': 0.15,       # 【优化v6】牛市保持15%现金（从20%降低，提高仓位）
+        'bear_market_cash_ratio': 0.30,       # 【优化v8】熊市保持30%现金（从35%降低）
+        'bull_market_max_positions': 8,       # 【优化v8】牛市最多持仓8只（从6只增加）
+        'bull_market_cash_ratio': 0.05,       # 【优化v8】牛市保持5%现金（从15%大幅降低）
         'require_benchmark_above_ma': False,
-        'benchmark_ma_period': 10,            # 【优化v6】基准均线周期从20周缩短到10周
+        'benchmark_ma_period': 8,             # 【优化v8】基准均线周期从10周缩短到8周
     },
 }
 
-# 【优化v6】绝望期买入确认参数 - 放宽条件，牛市适应性增强
+# 【优化v8】绝望期买入确认参数 - 牛市大幅放宽条件，解决空仓问题
 DESPAIR_CONFIRMATION = {
-    'rsi_threshold': 32,              # 【优化v6】RSI阈值从25提高到32（更容易触发）
-    'volume_shrink_ratio': 0.50,      # 【优化v6】成交量萎缩比例从45%提高到50%（放宽）
-    'require_support': True,          # 是否需要支撑确认
-    'min_down_weeks': 3,              # 【优化v6】最少连续下跌周数从4周减少到3周
-    'consecutive_weeks_confirm': 3,   # 【优化v6】确认周数从4周减少到3周（更快确认）
-    'require_stabilization': True,    # 是否需要企稳信号
-    'require_decline_slowdown': True, # 要求跌幅收窄
-    'decline_slowdown_ratio': 0.50,   # 【优化v6】跌幅收窄比例从0.40提高到0.50（放宽）
-    'benchmark_max_drawdown': -10,    # 【优化v6】基准最大回撤从-8%放宽到-10%
+    'rsi_threshold': 38,              # 【优化v8】RSI阈值从32提高到38（更容易触发）
+    'volume_shrink_ratio': 0.60,      # 【优化v8】成交量萎缩比例从50%提高到60%（大幅放宽）
+    'require_support': False,         # 【优化v8】不强制要求支撑确认（原为True）
+    'min_down_weeks': 2,              # 【优化v8】最少连续下跌周数从3周减少到2周
+    'consecutive_weeks_confirm': 2,   # 【优化v8】确认周数从3周减少到2周（更快确认）
+    'require_stabilization': False,   # 【优化v8】不强制要求企稳信号（原为True）
+    'require_decline_slowdown': False,# 【优化v8】不强制要求跌幅收窄（原为True）
+    'decline_slowdown_ratio': 0.60,   # 【优化v8】跌幅收窄比例从0.50提高到0.60（放宽）
+    'benchmark_max_drawdown': -15,    # 【优化v8】基准最大回撤从-10%放宽到-15%
     
-    # 二次确认机制 - 【优化v6】放宽
-    'require_price_stabilization': True,  # 要求价格企稳
-    'stabilization_weeks': 2,             # 【优化v6】价格企稳确认从3周减少到2周
-    'require_rsi_divergence': False,      # 【优化v6】不强制要求RSI底背离（原为True）
+    # 二次确认机制 - 【优化v8】大幅放宽
+    'require_price_stabilization': False,  # 【优化v8】不强制要求价格企稳（原为True）
+    'stabilization_weeks': 1,              # 【优化v8】价格企稳确认从2周减少到1周
+    'require_rsi_divergence': False,       # 不强制要求RSI底背离
     
-    # 反弹确认 - 【优化v6】进一步放宽
-    'require_bounce_confirm': True,       # 要求从低点反弹确认
-    'min_bounce_from_low': 4.0,           # 【优化v6】从最低点反弹从5%降到4%
-    'require_higher_low': False,          # 【优化v6】不强制要求更高低点（原为True）
-    'higher_low_margin': 0.5,             # 【优化v6】更高低点需高于前低0.5%（从1%降低）
+    # 反弹确认 - 【优化v8】大幅放宽
+    'require_bounce_confirm': False,       # 【优化v8】不强制要求反弹确认（原为True）
+    'min_bounce_from_low': 2.0,            # 【优化v8】从最低点反弹从4%降到2%
+    'require_higher_low': False,           # 不强制要求更高低点
+    'higher_low_margin': 0.3,              # 【优化v8】更高低点需高于前低0.3%（从0.5%降低）
     
-    # 【优化v6】周线阳线确认进一步放宽
-    'require_weekly_positive': True,      # 要求周线收阳
-    'min_weekly_positive_count': 1,       # 【优化v6】近4周至少1周收阳（从2周减少）
+    # 【优化v8】周线阳线确认进一步放宽
+    'require_weekly_positive': False,      # 【优化v8】不强制要求周线收阳（原为True）
+    'min_weekly_positive_count': 0,        # 【优化v8】近4周不要求收阳（从1周减少）
     
-    # 【优化v6】成交量放大确认放宽
-    'require_volume_confirm': False,      # 【优化v6】不强制要求放量确认（原为True）
-    'volume_surge_ratio': 1.10,           # 【优化v6】反弹时成交量需放大10%（从15%降低）
-    'require_positive_close': False,      # 【优化v6】不强制要求收阳（原为True）
+    # 【优化v8】成交量放大确认放宽
+    'require_volume_confirm': False,       # 不强制要求放量确认
+    'volume_surge_ratio': 1.05,            # 【优化v8】反弹时成交量需放大5%（从10%降低）
+    'require_positive_close': False,       # 不强制要求收阳
     
     # 【关闭】分批建仓 - 实测会降低胜率
-    'enable_partial_entry': False,        # 关闭分批建仓
-    'first_entry_ratio': 1.0,             # 一次性建仓100%
+    'enable_partial_entry': False,         # 关闭分批建仓
+    'first_entry_ratio': 1.0,              # 一次性建仓100%
     'confirm_entry_ratio': 0.0,
     'confirm_days': 5,
 }
@@ -523,4 +538,269 @@ SPECIAL_ASSET_OVERBOUGHT = {
     'rsi_extreme': 85,          # 极度超买RSI
     'rsi_high': 75,             # 高位RSI
     'max_score_when_overbought': 1,  # 超买时最大得分
+}
+
+# ==================== 【优化v7】市场趋势判断配置 ====================
+# 将市场分为上升趋势、下降趋势和震荡趋势，不同趋势下使用不同的策略参数
+MARKET_TREND_CONFIG = {
+    'enable': True,
+    
+    # 趋势判断参数
+    'trend_detection': {
+        'short_ma': 5,              # 短期均线（周）
+        'mid_ma': 10,               # 中期均线（周）
+        'long_ma': 20,              # 长期均线（周）
+        'slope_lookback': 4,        # 斜率计算回溯周数
+        
+        # 趋势判定阈值
+        'uptrend_slope_threshold': 0.5,      # 上升趋势斜率阈值（%）
+        'downtrend_slope_threshold': -0.5,   # 下降趋势斜率阈值（%）
+        'range_slope_threshold': 0.3,        # 震荡区间斜率阈值（%）
+        
+        # 均线排列确认
+        'require_ma_alignment': True,        # 是否要求均线排列确认
+        'ma_alignment_tolerance': 0.02,      # 均线排列容差（2%）
+    },
+    
+    # 上升趋势配置 - 【优化v8】大幅放宽牛市限制
+    'uptrend_params': {
+        'description': '上升趋势：均线多头排列，价格在均线上方',
+        'max_positions': 8,                  # 【优化v8】最大持仓数从6增加到8
+        'cash_ratio': 0.05,                  # 【优化v8】现金比例从15%降到5%（大幅降低）
+        'stop_loss': -15.0,                  # 【优化v8】止损线从-12%放宽到-15%
+        'take_profit': 30.0,                 # 【优化v8】止盈线从25%提高到30%
+        'trailing_stop_trigger': 30.0,       # 【优化v8】移动止损触发点从25%提高到30%
+        'trailing_stop_distance': 18.0,      # 【优化v8】移动止损距离从15%放宽到18%
+        'buy_buffer_days': 5,                # 【优化v8】买入缓冲期从7天减少到5天
+        'despair_buy_enabled': True,         # 允许绝望期买入
+        'despair_confidence_boost': 1.6,     # 【优化v8】绝望期置信度加成从1.4提高到1.6
+        'signal_threshold_adjust': -2,       # 【优化v8】信号阈值调整从-1改为-2（大幅降低门槛）
+        'sector_limit_boost': 1.5,           # 【优化v8】板块限制放宽系数从1.2提高到1.5
+        # 【新增v8】牛市趋势跟踪买入
+        'enable_trend_buy': True,            # 牛市启用趋势买入（不等绝望期）
+        'trend_buy_rsi_max': 60,             # 趋势买入最大RSI
+    },
+    
+    # 下降趋势配置
+    'downtrend_params': {
+        'description': '下降趋势：均线空头排列，价格在均线下方',
+        'max_positions': 3,                  # 最大持仓数（更少）
+        'cash_ratio': 0.45,                  # 现金比例（更高）
+        'stop_loss': -6.0,                   # 止损线（更严格）
+        'take_profit': 15.0,                 # 止盈线（更低）
+        'trailing_stop_trigger': 15.0,       # 移动止损触发点
+        'trailing_stop_distance': 8.0,       # 移动止损距离
+        'buy_buffer_days': 14,               # 买入缓冲期（更长）
+        'despair_buy_enabled': True,         # 允许绝望期买入（但更严格）
+        'despair_confidence_penalty': 0.5,   # 绝望期置信度惩罚
+        'signal_threshold_adjust': 2,        # 信号阈值调整（提高门槛）
+        'sector_limit_penalty': 0.7,         # 板块限制收紧系数
+        'max_weekly_signals': 1,             # 每周最多信号数
+        'require_reversal_signal': True,     # 要求反转信号确认
+    },
+    
+    # 震荡趋势配置
+    'range_params': {
+        'description': '震荡趋势：均线交织，价格在区间内波动',
+        'max_positions': 5,                  # 最大持仓数
+        'cash_ratio': 0.25,                  # 现金比例
+        'stop_loss': -8.0,                   # 止损线
+        'take_profit': 18.0,                 # 止盈线
+        'trailing_stop_trigger': 18.0,       # 移动止损触发点
+        'trailing_stop_distance': 10.0,      # 移动止损距离
+        'buy_buffer_days': 10,               # 买入缓冲期
+        'despair_buy_enabled': True,         # 允许绝望期买入
+        'despair_confidence_factor': 1.0,    # 绝望期置信度因子
+        'signal_threshold_adjust': 0,        # 信号阈值调整（默认）
+        'sector_limit_factor': 1.0,          # 板块限制因子
+        'prefer_range_bound_strategy': True, # 优先使用区间交易策略
+    },
+}
+
+# ==================== 【优化v7】分级绝望期判定配置 ====================
+# 将绝望期分为轻度、中度、深度三级，不同级别使用不同的买入策略
+DESPAIR_LEVEL_CONFIG = {
+    'enable': True,
+    
+    # 轻度绝望期（可以开始关注）
+    'light': {
+        'rsi_threshold': 40,                 # RSI阈值
+        'volume_shrink_ratio': 0.70,         # 成交量萎缩比例
+        'min_down_weeks': 2,                 # 最少下跌周数
+        'emotion_index_threshold': -0.15,    # 情绪指数阈值
+        'confidence': 0.5,                   # 基础置信度
+        'position_ratio': 0.3,               # 建仓比例（30%）
+        'description': '轻度绝望：开始关注，小仓位试探',
+        'require_bounce_confirm': False,     # 不要求反弹确认
+        'require_higher_low': False,         # 不要求更高低点
+    },
+    
+    # 中度绝望期（可以建仓）
+    'moderate': {
+        'rsi_threshold': 32,                 # RSI阈值
+        'volume_shrink_ratio': 0.55,         # 成交量萎缩比例
+        'min_down_weeks': 3,                 # 最少下跌周数
+        'emotion_index_threshold': -0.30,    # 情绪指数阈值
+        'confidence': 0.75,                  # 基础置信度
+        'position_ratio': 0.6,               # 建仓比例（60%）
+        'description': '中度绝望：可以建仓，中等仓位',
+        'require_bounce_confirm': True,      # 要求反弹确认
+        'min_bounce_pct': 3.0,               # 最小反弹幅度
+        'require_higher_low': False,         # 不要求更高低点
+    },
+    
+    # 深度绝望期（积极建仓）
+    'deep': {
+        'rsi_threshold': 25,                 # RSI阈值
+        'volume_shrink_ratio': 0.40,         # 成交量萎缩比例
+        'min_down_weeks': 4,                 # 最少下跌周数
+        'emotion_index_threshold': -0.50,    # 情绪指数阈值
+        'confidence': 1.0,                   # 基础置信度
+        'position_ratio': 1.0,               # 建仓比例（100%）
+        'description': '深度绝望：积极建仓，满仓位',
+        'require_bounce_confirm': True,      # 要求反弹确认
+        'min_bounce_pct': 5.0,               # 最小反弹幅度
+        'require_higher_low': True,          # 要求更高低点
+        'require_volume_surge': True,        # 要求放量确认
+        'volume_surge_ratio': 1.2,           # 放量比例
+    },
+    
+    # 分级绝望期的趋势调整
+    'trend_adjustments': {
+        'uptrend': {
+            'light_to_moderate': True,       # 上升趋势中轻度绝望升级为中度
+            'confidence_boost': 1.3,         # 置信度加成
+        },
+        'downtrend': {
+            'moderate_to_light': True,       # 下降趋势中中度绝望降级为轻度
+            'deep_to_moderate': True,        # 下降趋势中深度绝望降级为中度
+            'confidence_penalty': 0.6,       # 置信度惩罚
+        },
+        'range': {
+            'confidence_factor': 1.0,        # 震荡趋势置信度因子
+        },
+    },
+}
+
+# ==================== 【优化v7】趋势资产独立策略配置 ====================
+# 趋势资产使用独立的策略逻辑，不依赖绝望期买入
+TREND_ASSET_STRATEGY = {
+    'enable': True,
+    
+    # 趋势资产买入条件
+    'buy_conditions': {
+        'require_uptrend': True,             # 要求上升趋势
+        'min_trend_weeks': 2,                # 最少趋势确认周数
+        'price_above_ma': True,              # 价格在均线上方
+        'ma_period': 10,                     # 均线周期（周）
+        'min_ma_slope': 0.2,                 # 最小均线斜率（%）
+        'allow_range_buy': True,             # 允许震荡中买入
+        'range_buy_conditions': {
+            'near_support': True,            # 接近支撑位
+            'support_tolerance': 0.03,       # 支撑位容差（3%）
+            'rsi_oversold': 40,              # RSI超卖阈值
+        },
+    },
+    
+    # 趋势资产卖出条件
+    'sell_conditions': {
+        'trend_break': True,                 # 趋势破位卖出
+        'trend_break_threshold': -0.03,      # 趋势破位阈值（价格低于均线3%）
+        'ma_death_cross': True,              # 均线死叉卖出
+        'trailing_stop': True,               # 移动止损
+        'trailing_trigger': 15.0,            # 移动止损触发点
+        'trailing_distance': 10.0,           # 移动止损距离
+    },
+    
+    # 各趋势资产的特殊配置
+    'asset_overrides': {
+        '159934': {  # 黄金ETF
+            'allow_range_buy': True,         # 黄金可以在震荡中买入
+            'is_safe_haven': True,           # 避险资产
+            'downtrend_buy_allowed': True,   # 下跌趋势中也可买入（避险需求）
+            'min_trend_weeks': 1,            # 更快确认趋势
+        },
+        '159941': {  # 纳指ETF
+            'require_uptrend': True,         # 要求上升趋势
+            'min_trend_weeks': 2,
+            'allow_range_buy': True,
+        },
+        '164824': {  # 印度ETF
+            'require_uptrend': True,
+            'min_trend_weeks': 3,            # 更长确认周期
+            'allow_range_buy': False,        # 不在震荡中买入
+        },
+        '159985': {  # 豆粕ETF
+            'require_uptrend': True,
+            'min_trend_weeks': 3,
+            'allow_range_buy': False,
+        },
+        '160723': {  # 原油ETF
+            'require_uptrend': True,
+            'min_trend_weeks': 4,            # 最长确认周期
+            'allow_range_buy': False,
+            'strict_trend_follow': True,     # 严格趋势跟踪
+        },
+    },
+}
+
+# ==================== 【优化v7】动态冷却期配置 ====================
+# 根据卖出原因调整冷却期
+DYNAMIC_COOLDOWN_CONFIG = {
+    'enable': True,
+    
+    # 基于卖出原因的冷却期（周）
+    'cooldown_by_reason': {
+        'stop_loss': 8,                      # 止损后冷却8周
+        'trailing_stop': 4,                  # 移动止损后冷却4周
+        'take_profit': 2,                    # 止盈后冷却2周
+        'trend_break': 4,                    # 趋势破位后冷却4周
+        'time_stop': 2,                      # 到期卖出后冷却2周
+        'signal_sell': 3,                    # 信号卖出后冷却3周
+        'default': 4,                        # 默认冷却4周
+    },
+    
+    # 基于市场趋势的冷却期调整
+    'trend_adjustments': {
+        'uptrend': {
+            'factor': 0.5,                   # 上升趋势冷却期减半
+            'min_cooldown': 1,               # 最小冷却1周
+        },
+        'downtrend': {
+            'factor': 1.5,                   # 下降趋势冷却期增加50%
+            'max_cooldown': 16,              # 最大冷却16周
+        },
+        'range': {
+            'factor': 1.0,                   # 震荡趋势不调整
+        },
+    },
+    
+    # 基于盈亏的冷却期调整
+    'profit_adjustments': {
+        'profitable': {
+            'factor': 0.7,                   # 盈利卖出冷却期减少30%
+            'min_profit_pct': 5.0,           # 盈利超过5%才适用
+        },
+        'loss': {
+            'factor': 1.3,                   # 亏损卖出冷却期增加30%
+            'severe_loss_threshold': -10.0,  # 严重亏损阈值
+            'severe_loss_factor': 2.0,       # 严重亏损冷却期翻倍
+        },
+    },
+    
+    # 板块冷却
+    'sector_cooldown': {
+        'enable': True,
+        'consecutive_stop_loss_threshold': 2,  # 连续止损次数阈值
+        'sector_cooldown_weeks': 6,            # 板块冷却周数
+        'sector_cooldown_decay': True,         # 板块冷却递减
+        'decay_rate': 0.8,                     # 递减率
+    },
+    
+    # 冷却期递减机制
+    'cooldown_decay': {
+        'enable': True,
+        'decay_per_week': 1,                 # 每周递减1周
+        'min_remaining': 0,                  # 最小剩余0周
+    },
 }

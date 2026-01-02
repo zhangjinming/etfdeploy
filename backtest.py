@@ -22,7 +22,8 @@ from config import (
     ETF_SECTORS, SECTOR_LIMITS, CORRELATED_ETF_GROUPS,
     TREND_FILTER_PARAMS, DESPAIR_CONFIRMATION,
     STOP_LOSS_COOLDOWN, TREND_FOLLOW_ASSETS, TREND_PRIORITY_CONFIG,
-    TIME_STOP_PARAMS, BULL_MARKET_PARAMS, TREND_STOP_PARAMS
+    TIME_STOP_PARAMS, BULL_MARKET_PARAMS, TREND_STOP_PARAMS,
+    MARKET_TREND_CONFIG, DYNAMIC_COOLDOWN_CONFIG, PROFIT_LOCK_PARAMS
 )
 
 
@@ -134,9 +135,15 @@ class BacktestEngine:
         # 【v2】市场环境状态
         self.market_regime = 'unknown'
         
+        # 【优化v7】市场趋势状态
+        self.market_trend = 'range'
+        
         # 【新增】止损冷却记录
         self.stop_loss_cooldown: Dict[str, dict] = {}  # {symbol: {'date': str, 'count': int}}
         self.sector_stop_loss_count: Dict[str, int] = {}  # {sector: count}
+        
+        # 【优化v7】动态冷却期记录
+        self.dynamic_cooldown: Dict[str, dict] = {}  # {symbol: {'date': str, 'reason': str, 'weeks': int, 'profit_pct': float}}
         
     def reset(self):
         """重置账户"""
@@ -146,9 +153,149 @@ class BacktestEngine:
         self.daily_snapshots = []
         self.analysis_results = []
         self.market_regime = 'unknown'
+        self.market_trend = 'range'  # 【优化v7】
         # 【新增】重置冷却记录
         self.stop_loss_cooldown = {}
         self.sector_stop_loss_count = {}
+        self.dynamic_cooldown = {}  # 【优化v7】
+    
+    def calculate_dynamic_cooldown(self, symbol: str, sell_reason: str, profit_pct: float) -> int:
+        """
+        【优化v7】计算动态冷却期
+        
+        根据卖出原因、市场趋势和盈亏情况动态计算冷却周数
+        
+        Args:
+            symbol: ETF代码
+            sell_reason: 卖出原因
+            profit_pct: 盈亏比例
+            
+        Returns:
+            冷却周数
+        """
+        if not DYNAMIC_COOLDOWN_CONFIG.get('enable', True):
+            return STOP_LOSS_COOLDOWN.get('same_etf_cooldown_weeks', 8)
+        
+        cooldown_by_reason = DYNAMIC_COOLDOWN_CONFIG.get('cooldown_by_reason', {})
+        
+        # 1. 根据卖出原因确定基础冷却期
+        base_cooldown = cooldown_by_reason.get('default', 4)
+        
+        reason_lower = sell_reason.lower()
+        if '止损' in sell_reason or 'stop_loss' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('stop_loss', 8)
+        elif '移动止损' in sell_reason or 'trailing' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('trailing_stop', 4)
+        elif '止盈' in sell_reason or 'take_profit' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('take_profit', 2)
+        elif '趋势破位' in sell_reason or 'trend_break' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('trend_break', 4)
+        elif '到期' in sell_reason or 'time_stop' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('time_stop', 2)
+        elif '信号' in sell_reason or 'signal' in reason_lower:
+            base_cooldown = cooldown_by_reason.get('signal_sell', 3)
+        
+        # 2. 根据市场趋势调整
+        trend_adjustments = DYNAMIC_COOLDOWN_CONFIG.get('trend_adjustments', {})
+        trend_adj = trend_adjustments.get(self.market_trend, {})
+        
+        trend_factor = trend_adj.get('factor', 1.0)
+        base_cooldown = base_cooldown * trend_factor
+        
+        # 应用最小/最大限制
+        if self.market_trend == 'uptrend':
+            min_cooldown = trend_adj.get('min_cooldown', 1)
+            base_cooldown = max(base_cooldown, min_cooldown)
+        elif self.market_trend == 'downtrend':
+            max_cooldown = trend_adj.get('max_cooldown', 16)
+            base_cooldown = min(base_cooldown, max_cooldown)
+        
+        # 3. 根据盈亏调整
+        profit_adjustments = DYNAMIC_COOLDOWN_CONFIG.get('profit_adjustments', {})
+        
+        if profit_pct > 0:
+            # 盈利卖出
+            profit_adj = profit_adjustments.get('profitable', {})
+            min_profit = profit_adj.get('min_profit_pct', 5.0)
+            if profit_pct >= min_profit:
+                profit_factor = profit_adj.get('factor', 0.7)
+                base_cooldown = base_cooldown * profit_factor
+        else:
+            # 亏损卖出
+            loss_adj = profit_adjustments.get('loss', {})
+            severe_threshold = loss_adj.get('severe_loss_threshold', -10.0)
+            if profit_pct <= severe_threshold:
+                # 严重亏损
+                severe_factor = loss_adj.get('severe_loss_factor', 2.0)
+                base_cooldown = base_cooldown * severe_factor
+            else:
+                loss_factor = loss_adj.get('factor', 1.3)
+                base_cooldown = base_cooldown * loss_factor
+        
+        return int(round(base_cooldown))
+    
+    def record_dynamic_cooldown(self, symbol: str, date: str, reason: str, profit_pct: float):
+        """
+        【优化v7】记录动态冷却期
+        
+        Args:
+            symbol: ETF代码
+            date: 卖出日期
+            reason: 卖出原因
+            profit_pct: 盈亏比例
+        """
+        cooldown_weeks = self.calculate_dynamic_cooldown(symbol, reason, profit_pct)
+        
+        self.dynamic_cooldown[symbol] = {
+            'date': date,
+            'reason': reason,
+            'weeks': cooldown_weeks,
+            'profit_pct': profit_pct
+        }
+        
+        # 同时更新旧的止损冷却记录（兼容性）
+        if '止损' in reason:
+            self.record_stop_loss(symbol, date)
+    
+    def check_dynamic_cooldown(self, symbol: str, current_date: str) -> Tuple[bool, str]:
+        """
+        【优化v7】检查动态冷却期
+        
+        Args:
+            symbol: ETF代码
+            current_date: 当前日期
+            
+        Returns:
+            (是否可以买入, 原因)
+        """
+        if not DYNAMIC_COOLDOWN_CONFIG.get('enable', True):
+            return self.check_cooldown(symbol, current_date)
+        
+        if symbol not in self.dynamic_cooldown:
+            return True, ""
+        
+        cooldown_info = self.dynamic_cooldown[symbol]
+        cooldown_date = datetime.strptime(cooldown_info['date'], '%Y-%m-%d')
+        current = datetime.strptime(current_date, '%Y-%m-%d')
+        
+        weeks_since = (current - cooldown_date).days / 7
+        cooldown_weeks = cooldown_info['weeks']
+        
+        # 应用冷却期递减
+        decay_config = DYNAMIC_COOLDOWN_CONFIG.get('cooldown_decay', {})
+        if decay_config.get('enable', True):
+            decay_per_week = decay_config.get('decay_per_week', 1)
+            # 每周递减，但不低于0
+            effective_cooldown = max(0, cooldown_weeks - weeks_since * decay_per_week / cooldown_weeks)
+        else:
+            effective_cooldown = cooldown_weeks
+        
+        if weeks_since < effective_cooldown:
+            remaining = int(effective_cooldown - weeks_since)
+            reason = cooldown_info.get('reason', '卖出')
+            return False, f"冷却中({reason}，还需{remaining}周)"
+        
+        return True, ""
     
     def check_cooldown(self, symbol: str, current_date: str) -> Tuple[bool, str]:
         """
@@ -362,6 +509,13 @@ class BacktestEngine:
     
     def get_dynamic_max_positions(self) -> int:
         """【v2】根据市场环境动态调整最大持仓数"""
+        # 【优化v7】优先使用市场趋势配置
+        if MARKET_TREND_CONFIG.get('enable', True):
+            trend_params_key = f'{self.market_trend}_params'
+            trend_params = MARKET_TREND_CONFIG.get(trend_params_key, {})
+            if trend_params:
+                return trend_params.get('max_positions', self.max_positions)
+        
         market_filter = TREND_FILTER_PARAMS.get('market_filter', {})
         if not market_filter.get('enable', False):
             return self.max_positions
@@ -375,6 +529,13 @@ class BacktestEngine:
     
     def get_adaptive_stop_loss(self) -> float:
         """【新增v5】根据市场环境动态调整止损"""
+        # 【优化v7】优先使用市场趋势配置
+        if MARKET_TREND_CONFIG.get('enable', True):
+            trend_params_key = f'{self.market_trend}_params'
+            trend_params = MARKET_TREND_CONFIG.get(trend_params_key, {})
+            if trend_params:
+                return trend_params.get('stop_loss', RISK_PARAMS.get('stop_loss', -10.0))
+        
         if self.market_regime == 'bull':
             return RISK_PARAMS.get('bull_market_stop_loss', -12.0)
         elif self.market_regime == 'bear':
@@ -383,11 +544,45 @@ class BacktestEngine:
     
     def get_adaptive_buffer_days(self) -> int:
         """【新增v5】根据市场环境动态调整买入缓冲期"""
+        # 【优化v7】优先使用市场趋势配置
+        if MARKET_TREND_CONFIG.get('enable', True):
+            trend_params_key = f'{self.market_trend}_params'
+            trend_params = MARKET_TREND_CONFIG.get(trend_params_key, {})
+            if trend_params:
+                return trend_params.get('buy_buffer_days', RISK_PARAMS.get('buy_buffer_days', 10))
+        
         if self.market_regime == 'bull':
             return RISK_PARAMS.get('bull_market_buffer_days', 7)
         elif self.market_regime == 'bear':
             return RISK_PARAMS.get('bear_market_buffer_days', 12)
         return RISK_PARAMS.get('buy_buffer_days', 10)
+    
+    def get_adaptive_trailing_params(self) -> Tuple[float, float]:
+        """【优化v7】根据市场趋势获取移动止损参数"""
+        if MARKET_TREND_CONFIG.get('enable', True):
+            trend_params_key = f'{self.market_trend}_params'
+            trend_params = MARKET_TREND_CONFIG.get(trend_params_key, {})
+            if trend_params:
+                trigger = trend_params.get('trailing_stop_trigger', RISK_PARAMS.get('trailing_stop_trigger', 20.0))
+                distance = trend_params.get('trailing_stop_distance', RISK_PARAMS.get('trailing_stop_distance', 12.0))
+                return trigger, distance
+        
+        return RISK_PARAMS.get('trailing_stop_trigger', 20.0), RISK_PARAMS.get('trailing_stop_distance', 12.0)
+    
+    def get_adaptive_cash_ratio(self) -> float:
+        """【优化v7】根据市场趋势获取现金比例"""
+        if MARKET_TREND_CONFIG.get('enable', True):
+            trend_params_key = f'{self.market_trend}_params'
+            trend_params = MARKET_TREND_CONFIG.get(trend_params_key, {})
+            if trend_params:
+                return trend_params.get('cash_ratio', 0.25)
+        
+        market_filter = TREND_FILTER_PARAMS.get('market_filter', {})
+        if self.market_regime == 'bear':
+            return market_filter.get('bear_market_cash_ratio', 0.40)
+        elif self.market_regime == 'bull':
+            return market_filter.get('bull_market_cash_ratio', 0.20)
+        return 0.25
     
     def get_dynamic_trailing_stop(self, peak_profit: float) -> float:
         """【v2】根据盈利幅度获取动态止损距离"""
@@ -931,6 +1126,65 @@ class BacktestEngine:
         
         return False, ""
     
+    def should_profit_lock(self, pos: Position, date: str) -> Tuple[bool, str]:
+        """
+        【新增v8】利润锁定策略 - 持仓达到一定时间和利率后，回调时锁定利润
+        
+        条件：
+        1. 持仓时间在 min_holding_months 到 max_holding_months 之间
+        2. 曾经达到过 min_profit_pct 以上的盈利
+        3. 从最高点回撤超过 drawdown_trigger
+        
+        Args:
+            pos: 持仓信息
+            date: 当前日期
+            
+        Returns:
+            (是否应该卖出, 原因)
+        """
+        if not PROFIT_LOCK_PARAMS.get('enable', True):
+            return False, ""
+        
+        current_date = datetime.strptime(date, '%Y-%m-%d')
+        buy_date = datetime.strptime(pos.buy_date, '%Y-%m-%d')
+        holding_days = (current_date - buy_date).days
+        holding_months = holding_days / 30  # 约算月数
+        
+        # 检查持仓时间范围
+        min_months = PROFIT_LOCK_PARAMS.get('min_holding_months', 3)
+        max_months = PROFIT_LOCK_PARAMS.get('max_holding_months', 9)
+        
+        if holding_months < min_months or holding_months > max_months:
+            return False, ""
+        
+        # 计算峰值盈利（从最高价计算）
+        if pos.highest_price <= 0 or pos.cost_price <= 0:
+            return False, ""
+        
+        peak_profit_pct = (pos.highest_price - pos.cost_price) / pos.cost_price * 100
+        current_profit_pct = pos.profit_loss_pct
+        
+        # 检查是否曾经达到过最低盈利阈值
+        min_profit = PROFIT_LOCK_PARAMS.get('min_profit_pct', 16.0)
+        if peak_profit_pct < min_profit:
+            return False, ""
+        
+        # 计算从最高点的回撤
+        drawdown_from_peak = pos.drawdown_from_high  # 这是负数
+        drawdown_trigger = PROFIT_LOCK_PARAMS.get('drawdown_trigger', -6.0)
+        
+        # 检查是否触发回撤卖出
+        if drawdown_from_peak <= drawdown_trigger:
+            # 计算锁定的利润
+            lock_ratio = PROFIT_LOCK_PARAMS.get('lock_profit_ratio', 0.7)
+            locked_profit = peak_profit_pct * lock_ratio
+            
+            # 只有当前利润仍然为正时才卖出（避免亏损卖出）
+            if current_profit_pct > 0:
+                return True, f"利润锁定：峰值盈利{peak_profit_pct:.1f}%，回撤{drawdown_from_peak:.1f}%，锁定利润{current_profit_pct:.1f}%"
+        
+        return False, ""
+    
     def check_trend_asset_buy_condition(self, symbol: str, date: str) -> Tuple[bool, str]:
         """
         【新增v5】检查趋势资产买入条件
@@ -1003,6 +1257,10 @@ class BacktestEngine:
         market_regime = analysis_result.get('market_regime', {})
         self.market_regime = market_regime.get('regime', 'unknown')
         
+        # 【优化v7】更新市场趋势
+        market_trend = analysis_result.get('market_trend', {})
+        self.market_trend = market_trend.get('trend', 'range')
+        
         # 获取推荐买入的ETF代码
         buy_symbols = {p['symbol'] for p in long_positions}
         # 获取建议回避的ETF代码
@@ -1017,6 +1275,9 @@ class BacktestEngine:
         
         # 【优化v5】使用自适应买入缓冲期
         buy_buffer_days = self.get_adaptive_buffer_days()
+        
+        # 【优化v7】获取自适应移动止损参数
+        trailing_trigger, trailing_distance = self.get_adaptive_trailing_params()
         
         # 【优化v6】趋势跟踪止盈检查（替代固定周期）
         if use_trend_stop:
@@ -1033,9 +1294,12 @@ class BacktestEngine:
                     should_sell, reason = self.should_trend_stop(pos, date, analysis_result)
                     
                     if should_sell:
+                        profit_pct = pos.profit_loss_pct
                         trade = self.execute_sell(symbol, date, reason)
                         if trade:
                             trades_made.append(trade)
+                            # 【优化v7】记录动态冷却期
+                            self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
                             pct_str = f"+{pos.profit_loss_pct:.1f}%" if pos.profit_loss_pct >= 0 else f"{pos.profit_loss_pct:.1f}%"
                             print(f"  📉 趋势止盈 {pos.name}({symbol}): {reason}")
         else:
@@ -1055,9 +1319,12 @@ class BacktestEngine:
                         should_sell, reason = self.should_time_stop(pos, date, analysis_result)
                         
                         if should_sell:
+                            profit_pct = pos.profit_loss_pct
                             trade = self.execute_sell(symbol, date, reason)
                             if trade:
                                 trades_made.append(trade)
+                                # 【优化v7】记录动态冷却期
+                                self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
                                 pct_str = f"+{pos.profit_loss_pct:.1f}%" if pos.profit_loss_pct >= 0 else f"{pos.profit_loss_pct:.1f}%"
                                 print(f"  ⏰ 到期卖出 {pos.name}({symbol}): 持有{holding_days}天，收益{pct_str}")
                         else:
@@ -1067,11 +1334,7 @@ class BacktestEngine:
         # 2. 检查止损（包含动态移动止损）- 【优化v5】使用自适应止损
         stop_loss_threshold = self.get_adaptive_stop_loss()
         enable_trailing = RISK_PARAMS.get('enable_trailing_stop', False)
-        trailing_trigger = RISK_PARAMS.get('trailing_stop_trigger', 20.0)
         trailing_min_profit = RISK_PARAMS.get('trailing_stop_min_profit', 10.0)
-        
-        # 【优化v5】牛市使用更宽松的止损，熊市使用更严格的止损
-        # 注意：这里不再需要额外调整，因为get_adaptive_stop_loss已经处理了
         
         # 【v2】分批止损配置
         partial_stop = RISK_PARAMS.get('partial_stop_loss', {})
@@ -1100,23 +1363,40 @@ class BacktestEngine:
                 if holding_days < buy_buffer_days:
                     continue
                 
-                # 【v2】动态移动止损检查
+                # 【新增v8】利润锁定检查 - 优先于移动止损
+                should_lock, lock_reason = self.should_profit_lock(pos, date)
+                if should_lock:
+                    profit_pct = pct_change
+                    trade = self.execute_sell(symbol, date, lock_reason)
+                    if trade:
+                        trades_made.append(trade)
+                        # 记录动态冷却期
+                        self.record_dynamic_cooldown(symbol, date, lock_reason, profit_pct)
+                        print(f"  🔒 利润锁定 {pos.name}({symbol}): {lock_reason}")
+                    continue
+                
+                # 【v2】动态移动止损检查 - 【优化v7】使用自适应参数
                 if enable_trailing and pos.highest_price > 0:
                     # 计算从最高点的回撤
                     peak_profit = (pos.highest_price - pos.cost_price) / pos.cost_price * 100
                     drawdown_from_peak = (current_price - pos.highest_price) / pos.highest_price * 100
                     
                     # 【v2】根据盈利幅度获取动态止损距离
-                    trailing_distance = self.get_dynamic_trailing_stop(peak_profit)
+                    dynamic_trailing_distance = self.get_dynamic_trailing_stop(peak_profit)
+                    # 【优化v7】使用趋势自适应的止损距离
+                    effective_trailing_distance = min(dynamic_trailing_distance, trailing_distance)
                     
                     # 如果曾经盈利超过触发阈值，启用移动止损
-                    if peak_profit >= trailing_trigger and drawdown_from_peak <= -trailing_distance:
+                    if peak_profit >= trailing_trigger and drawdown_from_peak <= -effective_trailing_distance:
                         # 检查止损后是否还能保留最低利润
                         if pct_change >= trailing_min_profit:
                             reason = f"移动止损：最高盈利{peak_profit:.1f}%，回撤{abs(drawdown_from_peak):.1f}%"
+                            profit_pct = pct_change
                             trade = self.execute_sell(symbol, date, reason)
                             if trade:
                                 trades_made.append(trade)
+                                # 【优化v7】记录动态冷却期
+                                self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
                                 print(f"  📉 移动止损 {pos.name}({symbol}): 最高+{peak_profit:.1f}%，回撤{drawdown_from_peak:.1f}%")
                             continue
                 
@@ -1133,19 +1413,25 @@ class BacktestEngine:
                     # 已部分止损，检查是否需要清仓
                     if pct_change <= second_stop_pct:
                         reason = f"分批止损(清仓)：亏损{abs(pct_change):.1f}%"
+                        profit_pct = pct_change
                         trade = self.execute_sell(symbol, date, reason)
                         if trade:
                             trades_made.append(trade)
+                            # 【优化v7】记录动态冷却期
+                            self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
                             print(f"  🛑 清仓止损 {pos.name}({symbol}): 亏损{abs(pct_change):.1f}%")
                         continue
                 
                 # 检查是否触发固定止损（如果没有启用分批止损）
                 if not enable_partial_stop and pct_change <= stop_loss_threshold:
                     reason = f"触发止损：亏损{abs(pct_change):.1f}% > {abs(stop_loss_threshold)}%"
+                    profit_pct = pct_change
                     trade = self.execute_sell(symbol, date, reason)
                     if trade:
                         trades_made.append(trade)
-                        # 【新增】记录止损事件
+                        # 【优化v7】记录动态冷却期
+                        self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
+                        # 【新增】记录止损事件（兼容旧逻辑）
                         self.record_stop_loss(symbol, date)
                         print(f"  🛑 止损卖出 {pos.name}({symbol}): 亏损{abs(pct_change):.1f}%")
         
@@ -1164,9 +1450,12 @@ class BacktestEngine:
                         reason = p.get('reason', '策略建议回避')
                         break
                 
+                profit_pct = pos.profit_loss_pct
                 trade = self.execute_sell(symbol, date, reason)
                 if trade:
                     trades_made.append(trade)
+                    # 【优化v7】记录动态冷却期
+                    self.record_dynamic_cooldown(symbol, date, reason, profit_pct)
         
         # 4. 检查浮盈加仓
         add_trades = self.check_profit_add(date, analysis_result)
@@ -1196,10 +1485,16 @@ class BacktestEngine:
                 print(f"  📉 跳过 {name}({symbol}): 趋势资产买入条件不满足 - {trend_reason}")
                 continue
             
-            # 【新增】检查止损冷却期
-            can_buy, cooldown_reason = self.check_cooldown(symbol, date)
+            # 【优化v7】检查动态冷却期（优先）
+            can_buy, cooldown_reason = self.check_dynamic_cooldown(symbol, date)
             if not can_buy:
                 print(f"  ❄️ 跳过 {name}({symbol}): {cooldown_reason}")
+                continue
+            
+            # 【新增】检查止损冷却期（兼容旧逻辑）
+            can_buy_old, cooldown_reason_old = self.check_cooldown(symbol, date)
+            if not can_buy_old:
+                print(f"  ❄️ 跳过 {name}({symbol}): {cooldown_reason_old}")
                 continue
             
             # 【v2】检查板块仓位限制
@@ -1223,6 +1518,14 @@ class BacktestEngine:
             trend_priority = pos_info.get('trend_priority', 0)
             if trend_priority > 0:
                 reason += f" [趋势优先:{trend_priority:.1f}]"
+            
+            # 【优化v7】显示分级绝望期信息
+            etf_analysis = analysis_result.get('etf_analysis', {}).get(symbol, {})
+            despair_level = etf_analysis.get('despair_level', {})
+            if despair_level and despair_level.get('level'):
+                level_cn = {'light': '轻度', 'moderate': '中度', 'deep': '深度'}
+                level = despair_level['level']
+                reason += f" [绝望期:{level_cn.get(level, level)}]"
             
             trade = self.execute_buy(symbol, name, date, reason, partial=use_partial)
             if trade:
@@ -1264,7 +1567,7 @@ class BacktestEngine:
         # 获取交易日（周二）
         # 【测试加速】monthly_only=True: 只取每月第一周的周二，加快回测速度
         # 【正常模式】monthly_only=False: 取所有周二，用于实际回测
-        tuesdays = get_tuesdays_in_range(start_date, end_date, monthly_only=True)
+        tuesdays = get_tuesdays_in_range(start_date, end_date, monthly_only=False)
         
         if not tuesdays:
             print(f"在 {start_date} 到 {end_date} 期间没有周二")

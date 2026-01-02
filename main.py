@@ -82,10 +82,10 @@ if __name__ == "__main__":
     # main()
     
     # 模拟并验证历史数据
-    simulate_and_verify("2022-01-01", "2022-12-30")
+    #simulate_and_verify("2025-01-01", "2025-12-30")
     
     # 仅模拟（不验证）
     # simulate_period("2024-03-01", "2024-03-16")
     
     # 运行回测
-    #run_full_backtest("2020-01-01", "2020-12-30", initial_capital=10000.0)
+    run_full_backtest("2025-01-01", end_date="2025-12-31", initial_capital=10000.0)
