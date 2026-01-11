@@ -532,7 +532,10 @@ class StrengthWeaknessAnalyzer:
             'rsi': latest['rsi'],
             'price_position': price_position,
             'bb_position': latest['bb_position'],
+            'boll_position': latest['bb_position'],  # 别名，兼容v8
             'momentum': latest.get('momentum', 0),
+            'vol_ratio': latest['volume'] / latest['vol_ma_long'] if pd.notna(latest.get('vol_ma_long')) and latest.get('vol_ma_long', 0) > 0 else 1.0,
+            'pct_change': latest.get('pct_change', 0),
             'weekly_mode': self.use_weekly,
             'trend': trend,  # 新增趋势信息
             'symbol': self.symbol  # 新增：传递symbol用于商品类资产识别
